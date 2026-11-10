@@ -9,35 +9,46 @@ import {
   Camera,
   AlertTriangle,
   Upload,
-  Search,
   CheckCircle2,
   SlidersHorizontal,
+  ListOrdered,
+  X,
+  Check,
+  ChevronDown,
 } from 'lucide-react';
-import { OcrLanguage, MatchMode, MatchedWord, SnapshotData } from '../types';
+import { OcrLanguage, MatchMode, MatchedWord, SnapshotData, ChecklistItem, DetectedMatchGroup } from '../types';
 import { Translation } from '../translations';
 import { useOCRScanner } from '../hooks/useOCRScanner';
 import { SnapshotModal } from './SnapshotModal';
+import { CelebrationOverlay } from './CelebrationOverlay';
+import { triggerHaptic } from '../utils/audioAlert';
 
 interface Props {
-  searchQuery: string;
+  checklist: ChecklistItem[];
+  completedItems: ChecklistItem[];
+  initialTotalCount: number;
   ocrLanguage: OcrLanguage;
   matchMode: MatchMode;
   t: Translation;
   isRtl: boolean;
   initialImageSrc?: string | null;
   onBack: () => void;
-  onUpdateQuery: (query: string) => void;
+  onCompleteItem: (item: ChecklistItem) => void;
+  onRestartBatch: () => void;
 }
 
 export const CameraView: React.FC<Props> = ({
-  searchQuery,
+  checklist,
+  completedItems,
+  initialTotalCount,
   ocrLanguage,
   matchMode,
   t,
   isRtl,
   initialImageSrc,
   onBack,
-  onUpdateQuery,
+  onCompleteItem,
+  onRestartBatch,
 }) => {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -52,9 +63,9 @@ export const CameraView: React.FC<Props> = ({
   const [hapticsEnabled, setHapticsEnabled] = useState(true);
   const [activeMatchMode, setActiveMatchMode] = useState<MatchMode>(matchMode);
   const [showSettings, setShowSettings] = useState(false);
+  const [showQueueDrawer, setShowQueueDrawer] = useState(false);
   const [snapshot, setSnapshot] = useState<SnapshotData | null>(null);
-  const [isEditingQuery, setIsEditingQuery] = useState(false);
-  const [queryInput, setQueryInput] = useState(searchQuery);
+  const [successToast, setSuccessToast] = useState<string | null>(null);
 
   // Still/demo image mode fallback
   const [staticImageSrc, setStaticImageSrc] = useState<string | null>(initialImageSrc || null);
@@ -71,17 +82,16 @@ export const CameraView: React.FC<Props> = ({
     scanSource,
   } = useOCRScanner(ocrLanguage);
 
-  // Keep a ref of matched words for real-time 60fps canvas animation
+  // Keep a ref of matched words and detected groups for 60fps canvas drawing
   const matchesRef = useRef<MatchedWord[]>([]);
-  const frameDimRef = useRef<{ width: number; height: number }>({ width: 0, height: 0 });
+  const detectedGroupsRef = useRef<DetectedMatchGroup[]>([]);
+  const activeChecklistRef = useRef<ChecklistItem[]>(checklist);
+  activeChecklistRef.current = checklist;
 
   useEffect(() => {
     if (lastScanResult) {
       matchesRef.current = lastScanResult.matchedWords;
-      frameDimRef.current = {
-        width: lastScanResult.frameWidth,
-        height: lastScanResult.frameHeight,
-      };
+      detectedGroupsRef.current = lastScanResult.detectedGroups;
     }
   }, [lastScanResult]);
 
@@ -172,19 +182,20 @@ export const CameraView: React.FC<Props> = ({
     setIsTorchOn(false);
   };
 
-  // Throttled Scanning Loop (runs every ~650ms)
+  // Throttled Scanning Loop against all remaining items in active checklist
   useEffect(() => {
     let timer: NodeJS.Timeout;
 
     const runLoop = async () => {
       const source = staticImageSrc ? staticImageRef.current : videoRef.current;
-      if (source && !isInitializing) {
-        await scanSource(source, searchQuery, activeMatchMode, hapticsEnabled, soundEnabled);
+      const currentItems = activeChecklistRef.current;
+      if (source && !isInitializing && currentItems.length > 0) {
+        await scanSource(source, currentItems, activeMatchMode, hapticsEnabled, soundEnabled);
       }
       timer = setTimeout(runLoop, 650);
     };
 
-    timer = setTimeout(runLoop, 400);
+    timer = setTimeout(runLoop, 350);
 
     return () => {
       clearTimeout(timer);
@@ -192,7 +203,6 @@ export const CameraView: React.FC<Props> = ({
   }, [
     isInitializing,
     scanSource,
-    searchQuery,
     activeMatchMode,
     hapticsEnabled,
     soundEnabled,
@@ -222,7 +232,6 @@ export const CameraView: React.FC<Props> = ({
         if (ctx) {
           ctx.clearRect(0, 0, sW, sH);
 
-          // Get intrinsic dimensions
           let vW = 0;
           let vH = 0;
           if (staticImageSrc && staticImg) {
@@ -234,7 +243,6 @@ export const CameraView: React.FC<Props> = ({
           }
 
           if (vW > 0 && vH > 0) {
-            // Precise object-fit: cover mapping
             const scale = Math.max(sW / vW, sH / vH);
             const renderW = vW * scale;
             const renderH = vH * scale;
@@ -244,20 +252,17 @@ export const CameraView: React.FC<Props> = ({
             const matches = matchesRef.current;
             const time = performance.now() * 0.003;
 
-            // Draw glowing highlight boxes
             for (let i = 0; i < matches.length; i++) {
               const m = matches[i];
               let x0 = m.bbox.x0 * scale + offsetX;
-              let y0 = m.bbox.y0 * scale + offsetY;
-              let bW = (m.bbox.x1 - m.bbox.x0) * scale;
+              const y0 = m.bbox.y0 * scale + offsetY;
+              const bW = (m.bbox.x1 - m.bbox.x0) * scale;
               const bH = (m.bbox.y1 - m.bbox.y0) * scale;
 
-              // Mirror if front camera is active
               if (isFrontCamera && !staticImageSrc) {
                 x0 = sW - (x0 + bW);
               }
 
-              // Add a slight generous padding for modern look
               const padX = Math.max(4, bW * 0.1);
               const padY = Math.max(3, bH * 0.15);
               const rx = x0 - padX;
@@ -265,15 +270,14 @@ export const CameraView: React.FC<Props> = ({
               const rw = bW + padX * 2;
               const rh = bH + padY * 2;
 
-              // Animated glow pulsing
-              const pulse = 0.85 + Math.sin(time * 3 + i) * 0.15;
+              const pulse = 0.85 + Math.sin(time * 3.5 + i) * 0.15;
 
               ctx.save();
               ctx.shadowColor = '#10b981';
-              ctx.shadowBlur = 14 * pulse;
+              ctx.shadowBlur = 16 * pulse;
 
-              // Translucent green/teal highlight fill
-              ctx.fillStyle = `rgba(16, 185, 129, ${0.22 * pulse})`;
+              // Translucent green highlight fill
+              ctx.fillStyle = `rgba(16, 185, 129, ${0.24 * pulse})`;
               ctx.beginPath();
               ctx.roundRect(rx, ry, rw, rh, 8);
               ctx.fill();
@@ -288,36 +292,36 @@ export const CameraView: React.FC<Props> = ({
               ctx.strokeStyle = '#00f2fe';
               ctx.lineWidth = 3.5;
               ctx.beginPath();
-              // Top-left
               ctx.moveTo(rx, ry + cornerLen);
               ctx.lineTo(rx, ry);
               ctx.lineTo(rx + cornerLen, ry);
-              // Top-right
+
               ctx.moveTo(rx + rw - cornerLen, ry);
               ctx.lineTo(rx + rw, ry);
               ctx.lineTo(rx + rw, ry + cornerLen);
-              // Bottom-left
+
               ctx.moveTo(rx, ry + rh - cornerLen);
               ctx.lineTo(rx, ry + rh);
               ctx.lineTo(rx + cornerLen, ry + rh);
-              // Bottom-right
+
               ctx.moveTo(rx + rw - cornerLen, ry + rh);
               ctx.lineTo(rx + rw, ry + rh);
               ctx.lineTo(rx + rw, ry + rh - cornerLen);
               ctx.stroke();
 
-              // Floating pill badge label above the matched word
-              const badgeText = `${m.text} (${m.confidence}%)`;
+              // Floating pill badge displaying target item text and match confidence
+              const displayLabel = m.matchedItemText || m.text;
+              const badgeText = `${displayLabel} • ${m.confidence}%`;
               ctx.font = 'bold 11px sans-serif';
               const textMetrics = ctx.measureText(badgeText);
-              const pillW = textMetrics.width + 12;
-              const pillH = 18;
+              const pillW = textMetrics.width + 14;
+              const pillH = 20;
               const pillX = Math.max(6, Math.min(sW - pillW - 6, rx + (rw - pillW) / 2));
               const pillY = Math.max(6, ry - pillH - 4);
 
               ctx.shadowBlur = 6;
               ctx.shadowColor = '#06b6d4';
-              ctx.fillStyle = 'rgba(9, 13, 22, 0.9)';
+              ctx.fillStyle = 'rgba(9, 13, 22, 0.92)';
               ctx.beginPath();
               ctx.roundRect(pillX, pillY, pillW, pillH, 6);
               ctx.fill();
@@ -327,7 +331,7 @@ export const CameraView: React.FC<Props> = ({
               ctx.stroke();
 
               ctx.fillStyle = '#34d399';
-              ctx.fillText(badgeText, pillX + 6, pillY + 13);
+              ctx.fillText(badgeText, pillX + 7, pillY + 14);
 
               ctx.restore();
             }
@@ -344,8 +348,26 @@ export const CameraView: React.FC<Props> = ({
     };
   }, [isFrontCamera, staticImageSrc]);
 
+  // Handle "تەواو" (Done) button action on a found item
+  const handleMarkItemDone = (item: ChecklistItem) => {
+    triggerHaptic(60);
+
+    // Show temporary completion toast
+    setSuccessToast(t.completedToast(item.text));
+    setTimeout(() => {
+      setSuccessToast(null);
+    }, 2200);
+
+    // Instantly remove matching word overlays from the current frame
+    matchesRef.current = matchesRef.current.filter((w) => w.matchedItemId !== item.id);
+    detectedGroupsRef.current = detectedGroupsRef.current.filter((g) => g.item.id !== item.id);
+
+    // Call parent to remove from active checklist
+    onCompleteItem(item);
+  };
+
   // Capture High-Res Snapshot Compositing Video Frame + Glowing Overlay
-  const captureSnapshot = () => {
+  const captureSnapshot = (targetQueryText?: string) => {
     const video = videoRef.current;
     const staticImg = staticImageRef.current;
     const source = staticImageSrc ? staticImg : video;
@@ -364,24 +386,21 @@ export const CameraView: React.FC<Props> = ({
 
     if (srcW === 0 || srcH === 0) return;
 
-    // Create high-res composite canvas
     const snapCanvas = document.createElement('canvas');
     snapCanvas.width = srcW;
     snapCanvas.height = srcH;
     const ctx = snapCanvas.getContext('2d');
     if (!ctx) return;
 
-    // Draw video frame
     if (isFrontCamera && !staticImageSrc) {
       ctx.translate(srcW, 0);
       ctx.scale(-1, 1);
       ctx.drawImage(source, 0, 0, srcW, srcH);
-      ctx.setTransform(1, 0, 0, 1, 0, 0); // Reset
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
     } else {
       ctx.drawImage(source, 0, 0, srcW, srcH);
     }
 
-    // Overlay matched highlights in native resolution coordinates
     const matches = matchesRef.current;
     for (const m of matches) {
       let x0 = m.bbox.x0;
@@ -405,8 +424,8 @@ export const CameraView: React.FC<Props> = ({
       ctx.lineWidth = 4;
       ctx.stroke();
 
-      // Label badge
-      const badgeText = `${m.text} (${m.confidence}%)`;
+      const label = m.matchedItemText || m.text;
+      const badgeText = `${label} (${m.confidence}%)`;
       ctx.font = 'bold 20px sans-serif';
       const tw = ctx.measureText(badgeText).width;
       ctx.fillStyle = 'rgba(9, 13, 22, 0.92)';
@@ -429,7 +448,7 @@ export const CameraView: React.FC<Props> = ({
     setSnapshot({
       imageUrl: dataUrl,
       timestamp: Date.now(),
-      searchQuery,
+      searchQuery: targetQueryText || checklist.map((i) => i.text).join(', '),
       matchesCount: matches.length,
       matchedWords: matchedStrings,
       fullOcrText: lastScanResult?.fullText || '',
@@ -452,21 +471,22 @@ export const CameraView: React.FC<Props> = ({
     }
   };
 
-  // Return cleanly to home view
   const handleExit = () => {
     stopTracks();
     onBack();
   };
 
-  const matchesCount = lastScanResult?.matchedWords?.length || 0;
+  const totalCount = Math.max(initialTotalCount, checklist.length + completedItems.length);
+  const remainingCount = checklist.length;
+  const detectedGroups = lastScanResult?.detectedGroups || [];
+  const isAllCompleted = checklist.length === 0 && totalCount > 0;
 
   return (
     <div
       ref={containerRef}
       className="relative w-full h-[100dvh] overflow-hidden bg-black select-none touch-none"
-      dir="ltr" // Viewfinder coordinate container is ltr, controls handle their own dir
+      dir="ltr"
     >
-      {/* Hidden File Input for Fallback Photo Test */}
       <input
         type="file"
         ref={fileInputRef}
@@ -506,19 +526,17 @@ export const CameraView: React.FC<Props> = ({
 
       {/* Center Reticle / Active Scanner Laser Animation */}
       <div className="absolute inset-0 pointer-events-none z-10 flex items-center justify-center">
-        {/* Subtle HUD crosshair frame */}
         <div className="relative w-64 h-48 border border-white/20 rounded-2xl pointer-events-none opacity-40">
           <div className="absolute top-0 left-0 w-4 h-4 border-t-2 border-l-2 border-cyan-400 rounded-tl-lg" />
           <div className="absolute top-0 right-0 w-4 h-4 border-t-2 border-r-2 border-cyan-400 rounded-tr-lg" />
           <div className="absolute bottom-0 left-0 w-4 h-4 border-b-2 border-l-2 border-cyan-400 rounded-bl-lg" />
           <div className="absolute bottom-0 right-0 w-4 h-4 border-b-2 border-r-2 border-cyan-400 rounded-br-lg" />
         </div>
-        {/* Animated laser line */}
         <div className="absolute w-72 h-[2px] bg-gradient-to-r from-transparent via-cyan-400 to-transparent shadow-[0_0_8px_#00f2fe] animate-scan-line pointer-events-none" />
       </div>
 
-      {/* TOP FLOATING GLASSMORPHIC CONTROLS BAR */}
-      <div className="absolute top-0 inset-x-0 z-30 p-3 pt-[calc(var(--sat)+12px)] flex flex-col gap-2 pointer-events-auto">
+      {/* TOP FLOATING GLASSMORPHIC BAR */}
+      <div className="absolute top-0 inset-x-0 z-30 p-3 pt-[calc(var(--sat)+10px)] flex flex-col gap-2 pointer-events-auto">
         <div className="flex items-center justify-between gap-2 p-2 rounded-2xl glass-panel shadow-2xl">
           {/* Back Button */}
           <button
@@ -529,43 +547,22 @@ export const CameraView: React.FC<Props> = ({
             <span className="hidden xs:inline">{t.cameraBack}</span>
           </button>
 
-          {/* Current Target Badge & Quick Edit */}
-          <div className="flex-1 min-w-0 max-w-[200px] sm:max-w-xs text-center">
-            {isEditingQuery ? (
-              <form
-                onSubmit={(e) => {
-                  e.preventDefault();
-                  if (queryInput.trim()) {
-                    onUpdateQuery(queryInput.trim());
-                  }
-                  setIsEditingQuery(false);
-                }}
-                className="flex items-center"
-              >
-                <input
-                  type="text"
-                  value={queryInput}
-                  onChange={(e) => setQueryInput(e.target.value)}
-                  autoFocus
-                  onBlur={() => setIsEditingQuery(false)}
-                  className="w-full px-2.5 py-1 text-xs rounded-lg bg-slate-900 text-white border border-cyan-500 outline-none"
-                />
-              </form>
-            ) : (
-              <button
-                onClick={() => {
-                  setQueryInput(searchQuery);
-                  setIsEditingQuery(true);
-                }}
-                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-slate-900/90 border border-slate-700/80 hover:border-cyan-500/50 text-white max-w-full transition group"
-              >
-                <Search className="w-3.5 h-3.5 text-cyan-400 shrink-0" />
-                <span className="text-xs font-semibold truncate">
-                  "{searchQuery || '...'}"
-                </span>
-              </button>
-            )}
-          </div>
+          {/* Interactive Remaining Queue Pill (Tap to toggle drawer) */}
+          <button
+            onClick={() => setShowQueueDrawer((prev) => !prev)}
+            className="flex-1 min-w-0 max-w-[210px] sm:max-w-xs flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-xl bg-slate-900/90 border border-cyan-500/40 hover:border-cyan-400 text-white transition active:scale-95 shadow-md"
+            dir={isRtl ? 'rtl' : 'ltr'}
+          >
+            <ListOrdered className="w-4 h-4 text-cyan-400 shrink-0" />
+            <span className="text-xs font-bold text-white truncate">
+              {t.remainingOf(remainingCount, totalCount)}
+            </span>
+            <ChevronDown
+              className={`w-3.5 h-3.5 text-slate-400 transition-transform ${
+                showQueueDrawer ? 'rotate-180' : ''
+              }`}
+            />
+          </button>
 
           {/* Right Action Icons (Torch, Flip, Mute, Settings) */}
           <div className="flex items-center gap-1 shrink-0">
@@ -617,43 +614,15 @@ export const CameraView: React.FC<Props> = ({
           </div>
         </div>
 
-        {/* Status Pill Indicator */}
-        <div className="flex items-center justify-center">
-          <div
-            className={`inline-flex items-center gap-2 px-3.5 py-1.5 rounded-full text-xs font-medium backdrop-blur-md shadow-lg transition-all ${
-              matchesCount > 0
-                ? 'bg-emerald-500/90 text-slate-950 font-bold shadow-emerald-500/40 animate-pulse'
-                : 'bg-slate-900/80 text-slate-300 border border-slate-700/60'
-            }`}
-          >
-            {isInitializing ? (
-              <>
-                <div className="w-2 h-2 rounded-full bg-cyan-400 animate-ping" />
-                <span>{initStatusText}</span>
-              </>
-            ) : matchesCount > 0 ? (
-              <>
-                <CheckCircle2 className="w-4 h-4 text-slate-950" />
-                <span>
-                  {t.matchFound} ({matchesCount} {t.matchesCount})
-                </span>
-              </>
-            ) : (
-              <>
-                <div
-                  className={`w-2 h-2 rounded-full ${
-                    isProcessing ? 'bg-cyan-400 animate-ping' : 'bg-slate-500'
-                  }`}
-                />
-                <span>
-                  {isProcessing ? t.scanning : t.noMatches}
-                </span>
-              </>
-            )}
+        {/* Success Toast */}
+        {successToast && (
+          <div className="self-center px-4 py-2 rounded-full bg-emerald-500 text-slate-950 font-bold text-xs shadow-xl shadow-emerald-500/40 animate-bounce flex items-center gap-1.5 z-40">
+            <CheckCircle2 className="w-4 h-4" />
+            <span>{successToast}</span>
           </div>
-        </div>
+        )}
 
-        {/* Collapsible Quick Settings Tray */}
+        {/* Collapsible Settings Tray */}
         {showSettings && (
           <div
             className="p-3 rounded-2xl glass-panel border border-cyan-500/20 text-xs text-white space-y-2 animate-fade-in"
@@ -699,7 +668,169 @@ export const CameraView: React.FC<Props> = ({
         )}
       </div>
 
-      {/* CAMERA ERROR / PERMISSION FALLBACK OVERLAY */}
+      {/* REMAINING CHECKLIST DRAWER (Toggled by top pill) */}
+      {showQueueDrawer && (
+        <div
+          className="absolute inset-x-0 top-[calc(var(--sat)+62px)] z-30 p-3 max-h-[62vh] overflow-y-auto animate-fade-in pointer-events-auto"
+          dir={isRtl ? 'rtl' : 'ltr'}
+        >
+          <div className="rounded-3xl glass-panel border border-cyan-500/30 p-4 shadow-2xl text-white space-y-3">
+            <div className="flex items-center justify-between border-b border-slate-800 pb-2">
+              <div className="flex items-center gap-2">
+                <ListOrdered className="w-4 h-4 text-cyan-400" />
+                <h3 className="text-sm font-bold">{t.openDrawer}</h3>
+                <span className="text-[11px] px-2 py-0.5 rounded-full bg-cyan-500/20 text-cyan-400 font-mono">
+                  {checklist.length}
+                </span>
+              </div>
+              <button
+                onClick={() => setShowQueueDrawer(false)}
+                className="p-1 rounded-lg text-slate-400 hover:text-white"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            {/* List of remaining items */}
+            <div className="space-y-1.5 max-h-48 overflow-y-auto pr-1">
+              {checklist.map((item, idx) => (
+                <div
+                  key={item.id}
+                  className="flex items-center justify-between gap-2 p-2.5 rounded-xl bg-slate-900/80 border border-slate-800 hover:border-slate-700 transition"
+                >
+                  <div className="flex items-center gap-2 min-w-0">
+                    <span className="w-5 h-5 rounded-md bg-slate-800 text-slate-400 font-mono text-[11px] flex items-center justify-center shrink-0">
+                      {idx + 1}
+                    </span>
+                    <span className="text-xs font-semibold text-white truncate">
+                      {item.text}
+                    </span>
+                  </div>
+                  <button
+                    onClick={() => handleMarkItemDone(item)}
+                    className="flex items-center gap-1 px-2.5 py-1 rounded-lg bg-emerald-500/20 hover:bg-emerald-500 text-emerald-400 hover:text-slate-950 font-bold text-xs border border-emerald-500/30 transition shrink-0 active:scale-95"
+                  >
+                    <Check className="w-3.5 h-3.5" />
+                    <span>{t.doneButton}</span>
+                  </button>
+                </div>
+              ))}
+            </div>
+
+            {completedItems.length > 0 && (
+              <div className="pt-2 border-t border-slate-800 text-xs text-slate-400">
+                <span className="font-semibold text-slate-300">
+                  {t.completedItemsHistory} ({completedItems.length}):
+                </span>
+                <div className="flex flex-wrap gap-1 mt-1">
+                  {completedItems.map((c) => (
+                    <span
+                      key={c.id}
+                      className="px-2 py-0.5 rounded bg-emerald-500/15 text-emerald-400 text-[11px] line-through decoration-emerald-500/60"
+                    >
+                      {c.text}
+                    </span>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* DOCKED MATCH ACTION CARDS (Appears when 1 or more items from checklist are detected) */}
+      {detectedGroups.length > 0 && !showQueueDrawer && (
+        <div
+          className="absolute bottom-24 inset-x-0 z-30 px-3 max-h-48 overflow-y-auto flex flex-col gap-2 pointer-events-auto"
+          dir={isRtl ? 'rtl' : 'ltr'}
+        >
+          <div className="text-[11px] font-bold text-emerald-400 px-1 uppercase tracking-wider flex items-center gap-1.5 shadow-sm">
+            <span className="w-2 h-2 rounded-full bg-emerald-400 animate-ping" />
+            <span>{t.detectedOnScreen} ({detectedGroups.length})</span>
+          </div>
+
+          {detectedGroups.map((group) => (
+            <div
+              key={group.item.id}
+              className="flex items-center justify-between gap-3 p-3 rounded-2xl bg-slate-900/95 border-2 border-emerald-500 shadow-[0_0_20px_rgba(16,185,129,0.35)] backdrop-blur-xl animate-fade-in"
+            >
+              {/* Matched item text and confidence */}
+              <div className="min-w-0 flex-1">
+                <div className="flex items-center gap-2">
+                  <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+                  <h4 className="text-sm font-extrabold text-white truncate">
+                    {group.item.text}
+                  </h4>
+                </div>
+                <div className="text-[11px] text-emerald-400/90 font-mono mt-0.5">
+                  {t.confidence}: {group.primaryWord.confidence}%
+                </div>
+              </div>
+
+              {/* Action Buttons: Quick Snapshot + Big Green "تەواو" Button */}
+              <div className="flex items-center gap-2 shrink-0">
+                <button
+                  onClick={() => captureSnapshot(group.item.text)}
+                  title={t.takeSnapshot}
+                  className="p-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white border border-slate-700 active:scale-95 transition"
+                >
+                  <Camera className="w-4 h-4 text-cyan-400" />
+                </button>
+
+                <button
+                  onClick={() => handleMarkItemDone(group.item)}
+                  className="px-4 py-2.5 rounded-xl bg-gradient-to-r from-emerald-500 to-teal-400 hover:brightness-110 active:scale-95 text-slate-950 font-black text-sm shadow-lg shadow-emerald-500/40 transition-all flex items-center gap-1.5"
+                >
+                  <Check className="w-4 h-4 stroke-[3]" />
+                  <span>{t.doneButton}</span>
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* BOTTOM CONTROLS & MAIN SHUTTER BUTTON */}
+      <div className="absolute bottom-0 inset-x-0 z-20 p-4 pb-[calc(var(--sab)+14px)] flex items-center justify-between gap-4 pointer-events-auto">
+        <button
+          onClick={() => fileInputRef.current?.click()}
+          aria-label={t.uploadTestImage}
+          className="w-12 h-12 rounded-2xl glass-panel hover:bg-slate-800 text-slate-300 hover:text-white flex items-center justify-center shadow-lg active:scale-90 transition"
+        >
+          <Upload className="w-5 h-5 text-cyan-400" />
+        </button>
+
+        {/* Central Shutter Button */}
+        <div className="relative flex items-center justify-center">
+          <button
+            onClick={() => captureSnapshot()}
+            aria-label={t.takeSnapshot}
+            className="group relative w-18 h-18 sm:w-20 sm:h-20 rounded-full p-1 bg-gradient-to-tr from-cyan-500 via-teal-400 to-emerald-400 shadow-[0_0_25px_rgba(6,182,212,0.4)] active:scale-95 transition-all flex items-center justify-center"
+          >
+            <div className="w-full h-full rounded-full bg-slate-950 flex items-center justify-center border-2 border-white/80 group-hover:border-cyan-300 transition">
+              <Camera className="w-7 h-7 text-white group-hover:text-cyan-400 group-hover:scale-110 transition stroke-[2.2]" />
+            </div>
+            {detectedGroups.length > 0 && (
+              <span className="absolute inset-0 rounded-full border-2 border-emerald-400 animate-ping opacity-60 pointer-events-none" />
+            )}
+          </button>
+        </div>
+
+        {/* Right Info: Live / Found Status Pill */}
+        <div className="w-12 h-12 flex items-center justify-center text-xs font-mono">
+          {detectedGroups.length > 0 ? (
+            <span className="px-2 py-1 rounded-lg bg-emerald-500/20 text-emerald-400 font-bold border border-emerald-500/30 animate-pulse">
+              {detectedGroups.length}✓
+            </span>
+          ) : (
+            <span className="text-slate-500 font-semibold">
+              {isProcessing ? 'SCAN' : 'LIVE'}
+            </span>
+          )}
+        </div>
+      </div>
+
+      {/* CAMERA ERROR OVERLAY */}
       {cameraError && !staticImageSrc && (
         <div className="absolute inset-0 z-40 bg-slate-950/95 backdrop-blur-md p-6 flex flex-col items-center justify-center text-center text-white space-y-4">
           <div className="w-16 h-16 rounded-2xl bg-amber-500/20 text-amber-400 flex items-center justify-center border border-amber-500/30">
@@ -735,11 +866,11 @@ export const CameraView: React.FC<Props> = ({
         </div>
       )}
 
-      {/* INITIALIZING PROGRESS OVERLAY */}
+      {/* INITIALIZING OVERLAY */}
       {isInitializing && (
         <div className="absolute inset-0 z-20 bg-black/60 backdrop-blur-sm flex flex-col items-center justify-center p-6 text-center text-white space-y-3">
           <div className="w-12 h-12 rounded-xl bg-cyan-500/20 text-cyan-400 flex items-center justify-center border border-cyan-500/40 animate-pulse">
-            <Search className="w-6 h-6" />
+            <ListOrdered className="w-6 h-6" />
           </div>
           <div className="space-y-1">
             <h4 className="text-sm font-semibold">{initStatusText}</h4>
@@ -753,58 +884,6 @@ export const CameraView: React.FC<Props> = ({
         </div>
       )}
 
-      {/* BOTTOM FLOATING CONTROLS & SHUTTER BUTTON */}
-      <div className="absolute bottom-0 inset-x-0 z-30 p-4 pb-[calc(var(--sab)+16px)] flex items-center justify-between gap-4 pointer-events-auto">
-        {/* Left: Upload photo replacement button */}
-        <button
-          onClick={() => fileInputRef.current?.click()}
-          aria-label={t.uploadTestImage}
-          className="w-12 h-12 rounded-2xl glass-panel hover:bg-slate-800 text-slate-300 hover:text-white flex items-center justify-center shadow-lg active:scale-90 transition"
-        >
-          <Upload className="w-5 h-5 text-cyan-400" />
-        </button>
-
-        {/* Center: Large Floating Camera Shutter Button */}
-        <div className="relative flex items-center justify-center">
-          <button
-            onClick={captureSnapshot}
-            aria-label={t.takeSnapshot}
-            className="group relative w-18 h-18 sm:w-20 sm:h-20 rounded-full p-1 bg-gradient-to-tr from-cyan-500 via-teal-400 to-emerald-400 shadow-[0_0_25px_rgba(6,182,212,0.4)] active:scale-95 transition-all flex items-center justify-center"
-          >
-            <div className="w-full h-full rounded-full bg-slate-950 flex items-center justify-center border-2 border-white/80 group-hover:border-cyan-300 transition">
-              <Camera className="w-7 h-7 text-white group-hover:text-cyan-400 group-hover:scale-110 transition stroke-[2.2]" />
-            </div>
-            {/* Shutter pulsing ring when match is locked */}
-            {matchesCount > 0 && (
-              <span className="absolute inset-0 rounded-full border-2 border-emerald-400 animate-ping opacity-60 pointer-events-none" />
-            )}
-          </button>
-        </div>
-
-        {/* Right: Reset or Switch back to camera if in static mode */}
-        {staticImageSrc ? (
-          <button
-            onClick={() => {
-              setStaticImageSrc(null);
-              initCamera();
-            }}
-            className="px-3 py-2 rounded-xl glass-panel text-xs text-cyan-400 font-semibold hover:bg-slate-800 active:scale-90 transition"
-          >
-            Camera
-          </button>
-        ) : (
-          <div className="w-12 h-12 flex items-center justify-center text-xs text-slate-400">
-            {matchesCount > 0 ? (
-              <span className="font-mono text-emerald-400 font-bold">
-                {matchesCount}✓
-              </span>
-            ) : (
-              <span className="font-mono text-slate-500">LIVE</span>
-            )}
-          </div>
-        )}
-      </div>
-
       {/* Snapshot Preview Modal */}
       {snapshot && (
         <SnapshotModal
@@ -812,6 +891,16 @@ export const CameraView: React.FC<Props> = ({
           t={t}
           isRtl={isRtl}
           onClose={() => setSnapshot(null)}
+        />
+      )}
+
+      {/* Celebratory Completion Overlay when all items are done */}
+      {isAllCompleted && (
+        <CelebrationOverlay
+          completedItems={completedItems}
+          t={t}
+          isRtl={isRtl}
+          onRestart={onRestartBatch}
         />
       )}
     </div>

@@ -11,6 +11,14 @@ export interface BoundingBox {
   y1: number;
 }
 
+export interface ChecklistItem {
+  id: string;
+  text: string;
+  createdAt: number;
+  isCompleted?: boolean;
+  completedAt?: number;
+}
+
 export interface MatchedWord {
   id: string;
   text: string;
@@ -19,11 +27,20 @@ export interface MatchedWord {
   bbox: BoundingBox;
   isMatch: boolean;
   score?: number;
+  matchedItemId?: string;
+  matchedItemText?: string;
+}
+
+export interface DetectedMatchGroup {
+  item: ChecklistItem;
+  words: MatchedWord[];
+  primaryWord: MatchedWord;
 }
 
 export interface ScanResult {
   allWords: MatchedWord[];
   matchedWords: MatchedWord[];
+  detectedGroups: DetectedMatchGroup[];
   fullText: string;
   processingTimeMs: number;
   frameWidth: number;
@@ -45,5 +62,5 @@ export interface CameraSettings {
   sound: boolean;
   matchMode: MatchMode;
   facingMode: 'environment' | 'user';
-  fpsLimit: number; // e.g. 700ms throttle
+  fpsLimit: number;
 }

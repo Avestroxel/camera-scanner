@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { createWorker, Worker } from 'tesseract.js';
-import { OcrLanguage, MatchMode, MatchedWord, ScanResult } from '../types';
-import { checkMatch } from '../utils/textMatcher';
+import { OcrLanguage, MatchMode, MatchedWord, ScanResult, ChecklistItem, DetectedMatchGroup } from '../types';
+import { checkMatch, normalizeText } from '../utils/textMatcher';
 import { triggerHaptic, playMatchChime } from '../utils/audioAlert';
 
 export function useOCRScanner(selectedLang: OcrLanguage) {
@@ -16,7 +16,7 @@ export function useOCRScanner(selectedLang: OcrLanguage) {
   const offscreenCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const activeLangRef = useRef<OcrLanguage>(selectedLang);
   const isBusyRef = useRef(false);
-  const hadMatchesRef = useRef(false);
+  const previousMatchedItemIdsRef = useRef<Set<string>>(new Set());
 
   // Initialize or reinitialize worker when language changes
   useEffect(() => {
@@ -86,16 +86,16 @@ export function useOCRScanner(selectedLang: OcrLanguage) {
     };
   }, [selectedLang]);
 
-  // Main scan function
+  // Main scan function comparing against all active checklist items
   const scanSource = useCallback(
     async (
       source: HTMLVideoElement | HTMLCanvasElement | HTMLImageElement,
-      searchQuery: string,
+      targetItems: ChecklistItem[],
       mode: MatchMode,
       enableHaptics = true,
       enableSound = true
     ): Promise<ScanResult | null> => {
-      if (!workerRef.current || isBusyRef.current || isInitializing) {
+      if (!workerRef.current || isBusyRef.current || isInitializing || targetItems.length === 0) {
         return null;
       }
 
@@ -125,7 +125,6 @@ export function useOCRScanner(selectedLang: OcrLanguage) {
         }
 
         // Downscale offscreen frame for responsive 60fps OCR
-        // Scale to ~800px max width/height to drastically reduce latency while maintaining high text fidelity
         const targetW = Math.min(840, srcW);
         const scaleFactor = targetW / srcW;
         const targetH = Math.round(srcH * scaleFactor);
@@ -150,17 +149,40 @@ export function useOCRScanner(selectedLang: OcrLanguage) {
         // Perform recognition on offscreen canvas
         const ret = await workerRef.current.recognize(canvas);
 
-        // Collect all detected words across blocks -> paragraphs -> lines
-        const wordsData: Array<{ text: string; confidence: number; bbox: { x0: number; y0: number; x1: number; y1: number } }> = [];
+        // Collect both individual words and full lines
+        interface RawToken {
+          text: string;
+          confidence: number;
+          bbox: { x0: number; y0: number; x1: number; y1: number };
+          isLine?: boolean;
+        }
+        const rawTokens: RawToken[] = [];
+
         if (ret.data.blocks) {
           for (const block of ret.data.blocks) {
             if (block.paragraphs) {
               for (const para of block.paragraphs) {
                 if (para.lines) {
                   for (const line of para.lines) {
+                    // Add the line token for multi-word phrase matching
+                    if (line.text && line.text.trim().length > 1) {
+                      rawTokens.push({
+                        text: line.text.trim(),
+                        confidence: Math.round(line.confidence || 0),
+                        bbox: line.bbox,
+                        isLine: true,
+                      });
+                    }
                     if (line.words) {
                       for (const w of line.words) {
-                        wordsData.push(w);
+                        if (w.text && w.text.trim().length > 0) {
+                          rawTokens.push({
+                            text: w.text.trim(),
+                            confidence: Math.round(w.confidence || 0),
+                            bbox: w.bbox,
+                            isLine: false,
+                          });
+                        }
                       }
                     }
                   }
@@ -170,46 +192,85 @@ export function useOCRScanner(selectedLang: OcrLanguage) {
           }
         }
 
-        // Fallback if words array exists directly
-        const rawAnyData = ret.data as unknown as { words?: typeof wordsData };
-        if (wordsData.length === 0 && Array.isArray(rawAnyData.words)) {
-          wordsData.push(...rawAnyData.words);
-        }
-
+        const invScale = 1 / scaleFactor;
         const allWords: MatchedWord[] = [];
         const matchedWords: MatchedWord[] = [];
+        const itemToMatchesMap = new Map<string, MatchedWord[]>();
 
-        for (let i = 0; i < wordsData.length; i++) {
-          const w = wordsData[i];
-          const rawText = w.text ? w.text.trim() : '';
-          if (!rawText || rawText.length < 1) continue;
+        // Pre-normalize target items for ultra-fast comparison
+        const normalizedTargets = targetItems.map((item) => ({
+          item,
+          normText: normalizeText(item.text),
+          isMultiWord: item.text.trim().includes(' '),
+        }));
 
-          // Map bounding box from offscreen downscaled coords back to intrinsic source coords
-          const invScale = 1 / scaleFactor;
+        for (let i = 0; i < rawTokens.length; i++) {
+          const t = rawTokens[i];
+          const rawText = t.text;
           const bbox = {
-            x0: Math.round(w.bbox.x0 * invScale),
-            y0: Math.round(w.bbox.y0 * invScale),
-            x1: Math.round(w.bbox.x1 * invScale),
-            y1: Math.round(w.bbox.y1 * invScale),
+            x0: Math.round(t.bbox.x0 * invScale),
+            y0: Math.round(t.bbox.y0 * invScale),
+            x1: Math.round(t.bbox.x1 * invScale),
+            y1: Math.round(t.bbox.y1 * invScale),
           };
 
-          const { isMatch, score } = searchQuery.trim()
-            ? checkMatch(rawText, searchQuery, mode)
-            : { isMatch: false, score: 0 };
+          let matchedItem: ChecklistItem | null = null;
+          let highestScore = 0;
 
+          // Check token against all active checklist items
+          for (const target of normalizedTargets) {
+            // For multi-word items, prefer line tokens; for single words, prefer word tokens
+            if (target.isMultiWord && !t.isLine) {
+              continue;
+            }
+            if (!target.isMultiWord && t.isLine) {
+              continue;
+            }
+
+            const { isMatch, score } = checkMatch(rawText, target.item.text, mode);
+            if (isMatch && score > highestScore) {
+              highestScore = score;
+              matchedItem = target.item;
+            }
+          }
+
+          const isMatch = Boolean(matchedItem);
           const item: MatchedWord = {
-            id: `w-${i}-${Date.now()}`,
+            id: `tok-${i}-${Date.now()}`,
             text: rawText,
             normalizedText: rawText,
-            confidence: Math.round(w.confidence || 0),
+            confidence: t.confidence,
             bbox,
             isMatch,
-            score,
+            score: highestScore,
+            matchedItemId: matchedItem?.id,
+            matchedItemText: matchedItem?.text,
           };
 
           allWords.push(item);
-          if (isMatch) {
+
+          if (isMatch && matchedItem) {
             matchedWords.push(item);
+            if (!itemToMatchesMap.has(matchedItem.id)) {
+              itemToMatchesMap.set(matchedItem.id, []);
+            }
+            itemToMatchesMap.get(matchedItem.id)!.push(item);
+          }
+        }
+
+        // Build DetectedMatchGroup per detected checklist item
+        const detectedGroups: DetectedMatchGroup[] = [];
+        for (const target of normalizedTargets) {
+          const words = itemToMatchesMap.get(target.item.id);
+          if (words && words.length > 0) {
+            // Find highest confidence or first word as primary
+            const primaryWord = words.reduce((prev, curr) =>
+              (curr.confidence > prev.confidence ? curr : prev), words[0]);
+            detectedGroups.push({
+              item: target.item,
+              words,
+              primaryWord,
+            });
           }
         }
 
@@ -217,6 +278,7 @@ export function useOCRScanner(selectedLang: OcrLanguage) {
         const result: ScanResult = {
           allWords,
           matchedWords,
+          detectedGroups,
           fullText: ret.data.text || '',
           processingTimeMs: Math.round(endTime - startTime),
           frameWidth: srcW,
@@ -225,16 +287,21 @@ export function useOCRScanner(selectedLang: OcrLanguage) {
 
         setLastScanResult(result);
 
-        // Trigger haptics and audio chime on fresh match
-        if (matchedWords.length > 0) {
-          if (!hadMatchesRef.current) {
-            if (enableHaptics) triggerHaptic(60);
-            if (enableSound) playMatchChime();
+        // Trigger haptics and audio chime if any NEW item was locked onto
+        const currentMatchedIds = new Set(detectedGroups.map((g) => g.item.id));
+        let hasNewMatch = false;
+        for (const id of currentMatchedIds) {
+          if (!previousMatchedItemIdsRef.current.has(id)) {
+            hasNewMatch = true;
+            break;
           }
-          hadMatchesRef.current = true;
-        } else {
-          hadMatchesRef.current = false;
         }
+
+        if (hasNewMatch) {
+          if (enableHaptics) triggerHaptic(60);
+          if (enableSound) playMatchChime();
+        }
+        previousMatchedItemIdsRef.current = currentMatchedIds;
 
         return result;
       } catch (err) {
