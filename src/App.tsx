@@ -33,7 +33,7 @@ export default function App() {
 
   const [completedItems, setCompletedItems] = useState<ChecklistItem[]>([]);
   const [initialTotalCount, setInitialTotalCount] = useState<number>(() => checklist.length);
-  const [ocrLanguage, setOcrLanguage] = useState<OcrLanguage>('eng+ara');
+  const [ocrLanguage, setOcrLanguage] = useState<OcrLanguage>('eng');
   const [matchMode] = useState<MatchMode>('contains'); // Always use smart flexible/contains matching
   const [uiLang, setUiLang] = useState<UILanguage>('ku'); // Default to Kurdish as requested
 

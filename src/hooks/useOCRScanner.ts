@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
-import { createWorker, Worker } from 'tesseract.js';
+import { createWorker, Worker, PSM } from 'tesseract.js';
 import { OcrLanguage, MatchMode, MatchedWord, ScanResult, ChecklistItem, DetectedMatchGroup } from '../types';
 import { checkMatch } from '../utils/textMatcher';
 import { triggerHaptic, playMatchChime } from '../utils/audioAlert';
@@ -20,7 +20,7 @@ export function useOCRScanner(selectedLang: OcrLanguage) {
   const isBusyRef = useRef(false);
   const previousMatchedItemIdsRef = useRef<Set<string>>(new Set());
 
-  // Initialize or reinitialize Tesseract v5 worker when language changes
+  // Initialize or reinitialize Tesseract v5 worker with PSM 11 (Sparse text)
   useEffect(() => {
     let isCancelled = false;
     activeLangRef.current = selectedLang;
@@ -29,25 +29,24 @@ export function useOCRScanner(selectedLang: OcrLanguage) {
       setIsInitializing(true);
       setWorkerStatus('initializing');
       setInitProgress(15);
-      setInitStatusText(`Loading ${selectedLang} models...`);
+      setInitStatusText(`Loading ${selectedLang}...`);
 
       if (workerRef.current) {
         try {
           await workerRef.current.terminate();
         } catch {
-          // Ignore termination errors
+          // ignore
         }
         workerRef.current = null;
       }
 
       try {
-        // Tesseract v5 compliant createWorker call
         const worker = await createWorker(selectedLang, 1, {
           logger: (m) => {
             if (!isCancelled && m.status) {
               if (m.status === 'loading tesseract core') {
                 setInitProgress(25);
-                setInitStatusText('Loading Tesseract Core...');
+                setInitStatusText('Loading Engine...');
               } else if (m.status === 'initializing tesseract') {
                 setInitProgress(50);
                 setInitStatusText('Initializing OCR...');
@@ -65,15 +64,21 @@ export function useOCRScanner(selectedLang: OcrLanguage) {
           return;
         }
 
+        // Configure parameters for maximum real-time speed on sparse text & codes at distance
+        // PSM 11 = Sparse text (Find as much text as possible in no particular order)
+        await worker.setParameters({
+          tessedit_pageseg_mode: PSM.SPARSE_TEXT,
+        });
+
         workerRef.current = worker;
         setIsInitializing(false);
         setWorkerStatus('ready');
         setInitProgress(100);
-        setInitStatusText('OCR Ready');
+        setInitStatusText('Ready');
         setError(null);
       } catch (err) {
         if (!isCancelled) {
-          console.error('OCR initialization failed:', err);
+          console.error('OCR init error:', err);
           const errorMsg = err instanceof Error ? err.message : String(err);
           setError(`Worker Error: ${errorMsg}`);
           setWorkerStatus('error');
@@ -94,7 +99,7 @@ export function useOCRScanner(selectedLang: OcrLanguage) {
     };
   }, [selectedLang]);
 
-  // Main scan function with grayscale + contrast pre-processing
+  // Main scan function: High-DPI 1280px canvas with contrast boost for distance accuracy
   const scanSource = useCallback(
     async (
       source: HTMLVideoElement | HTMLCanvasElement | HTMLImageElement,
@@ -103,14 +108,12 @@ export function useOCRScanner(selectedLang: OcrLanguage) {
       enableHaptics = true,
       enableSound = true
     ): Promise<ScanResult | null> => {
-      // Prevent overlapping calls or scanning when worker isn't ready
       if (!workerRef.current || isBusyRef.current || isInitializing || targetItems.length === 0) {
         return null;
       }
 
-      // Check readyState for HTMLVideoElement to ensure valid camera frame
       if (source instanceof HTMLVideoElement) {
-        if (source.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) {
+        if (source.readyState < HTMLMediaElement.HAVE_CURRENT_DATA || source.videoWidth === 0) {
           return null;
         }
       }
@@ -139,8 +142,8 @@ export function useOCRScanner(selectedLang: OcrLanguage) {
           return null;
         }
 
-        // Downscale offscreen frame to ~800px width for fast mobile OCR
-        const targetW = Math.min(800, srcW);
+        // High-DPI frame width 1280px to retain small and distant text sharply
+        const targetW = Math.min(1280, srcW);
         const scaleFactor = targetW / srcW;
         const targetH = Math.round(srcH * scaleFactor);
 
@@ -158,19 +161,16 @@ export function useOCRScanner(selectedLang: OcrLanguage) {
           return null;
         }
 
-        // Draw downscaled frame
         ctx.drawImage(source, 0, 0, targetW, targetH);
 
-        // Apply Grayscale and Contrast Enhancement for mobile camera accuracy
+        // High-contrast grayscale conversion for distance detection
         try {
           const imgData = ctx.getImageData(0, 0, targetW, targetH);
           const data = imgData.data;
-          // Contrast factor enhancement (+45)
-          const contrast = 45;
+          const contrast = 55; // sharp contrast
           const factor = (259 * (contrast + 255)) / (255 * (259 - contrast));
 
           for (let i = 0; i < data.length; i += 4) {
-            // Standard Luminance conversion
             const gray = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
             const enhanced = Math.min(255, Math.max(0, factor * (gray - 128) + 128));
             data[i] = enhanced;
@@ -178,20 +178,17 @@ export function useOCRScanner(selectedLang: OcrLanguage) {
             data[i + 2] = enhanced;
           }
           ctx.putImageData(imgData, 0, 0);
-        } catch (filterErr) {
-          // If security or canvas read fails, proceed with raw frame
-          console.warn('Canvas filter error:', filterErr);
+        } catch {
+          // continue with raw canvas if security policy prevents reading
         }
 
-        // Perform recognition on the enhanced offscreen canvas
         const ret = await workerRef.current.recognize(canvas);
         const rawFullText = (ret.data.text || '').trim();
 
-        // Update raw text preview for live debug pill (first 60 characters)
-        const sanitizedPreview = rawFullText.replace(/\s+/g, ' ').slice(0, 60);
+        // Update raw text preview
+        const sanitizedPreview = rawFullText.replace(/\s+/g, ' ').slice(0, 50);
         setRawTextPreview(sanitizedPreview);
 
-        // Collect both full lines AND individual words
         interface ExtractedToken {
           text: string;
           confidence: number;
@@ -200,7 +197,7 @@ export function useOCRScanner(selectedLang: OcrLanguage) {
         }
         const extractedTokens: ExtractedToken[] = [];
 
-        // 1. Process Lines
+        // Lines and Words from Tesseract result
         if (ret.data.lines && ret.data.lines.length > 0) {
           for (const line of ret.data.lines) {
             if (line.text && line.text.trim().length > 0) {
@@ -211,7 +208,6 @@ export function useOCRScanner(selectedLang: OcrLanguage) {
                 isLine: true,
               });
 
-              // Also collect words inside line
               if (line.words) {
                 for (const w of line.words) {
                   if (w.text && w.text.trim().length > 0) {
@@ -228,7 +224,7 @@ export function useOCRScanner(selectedLang: OcrLanguage) {
           }
         }
 
-        // 2. Process Blocks as fallback if lines weren't populated
+        // Fallback to blocks if lines wasn't populated
         if (extractedTokens.length === 0 && ret.data.blocks) {
           for (const block of ret.data.blocks) {
             if (block.paragraphs) {
@@ -262,14 +258,12 @@ export function useOCRScanner(selectedLang: OcrLanguage) {
           }
         }
 
-        // Fallback: check raw full text directly against targets
-        // If whole text contains a target, synthesize a fallback token
+        // Whole text check: if the entire parsed text contains a target, synthesize a box
         for (const target of targetItems) {
-          const { isMatch, score } = checkMatch(rawFullText, target.text, mode);
+          const { isMatch } = checkMatch(rawFullText, target.text, mode);
           if (isMatch && !extractedTokens.some((t) => checkMatch(t.text, target.text, mode).isMatch)) {
-            // Add a synthetic center token so the Done card pops up
             extractedTokens.push({
-              text: rawFullText.slice(0, 30),
+              text: target.text,
               confidence: 85,
               bbox: {
                 x0: Math.round(targetW * 0.2),
@@ -300,7 +294,6 @@ export function useOCRScanner(selectedLang: OcrLanguage) {
           let matchedItem: ChecklistItem | null = null;
           let highestScore = 0;
 
-          // Check token against every active checklist item
           for (const item of targetItems) {
             const { isMatch, score } = checkMatch(rawText, item.text, mode);
             if (isMatch && score > highestScore) {
@@ -333,12 +326,10 @@ export function useOCRScanner(selectedLang: OcrLanguage) {
           }
         }
 
-        // Build DetectedMatchGroup per detected checklist item
         const detectedGroups: DetectedMatchGroup[] = [];
         for (const target of targetItems) {
           const words = itemToMatchesMap.get(target.id);
           if (words && words.length > 0) {
-            // Find highest confidence word/line as primary
             const primaryWord = words.reduce((prev, curr) =>
               (curr.confidence > prev.confidence ? curr : prev), words[0]);
             detectedGroups.push({
@@ -362,7 +353,6 @@ export function useOCRScanner(selectedLang: OcrLanguage) {
 
         setLastScanResult(result);
 
-        // Haptic feedback & audio chime when a new match is detected
         const currentMatchedIds = new Set(detectedGroups.map((g) => g.item.id));
         let hasNewMatch = false;
         for (const id of currentMatchedIds) {

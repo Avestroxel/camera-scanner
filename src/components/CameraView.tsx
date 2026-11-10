@@ -9,10 +9,9 @@ import {
   ChevronDown,
   RefreshCw,
 } from 'lucide-react';
-import { OcrLanguage, MatchMode, MatchedWord, SnapshotData, ChecklistItem, DetectedMatchGroup } from '../types';
+import { OcrLanguage, MatchMode, MatchedWord, ChecklistItem, DetectedMatchGroup } from '../types';
 import { Translation } from '../translations';
 import { useOCRScanner } from '../hooks/useOCRScanner';
-import { SnapshotModal } from './SnapshotModal';
 import { CelebrationOverlay } from './CelebrationOverlay';
 import { triggerHaptic } from '../utils/audioAlert';
 
@@ -51,10 +50,14 @@ export const CameraView: React.FC<Props> = ({
   const [isTorchOn, setIsTorchOn] = useState(false);
   const [isFrontCamera, setIsFrontCamera] = useState(false);
   const [showQueueDropdown, setShowQueueDropdown] = useState(false);
-  const [snapshot, setSnapshot] = useState<SnapshotData | null>(null);
   const [successToast, setSuccessToast] = useState<string | null>(null);
 
-  // OCR Hook (Tesseract v5 compatible)
+  // Zoom control state (Hardware or Digital fallback)
+  const [zoomLevel, setZoomLevel] = useState<number>(1);
+  const [hardwareZoomAvailable, setHardwareZoomAvailable] = useState(false);
+  const [zoomMinMax, setZoomMinMax] = useState<{ min: number; max: number }>({ min: 1, max: 3 });
+
+  // OCR Hook (Tesseract v5 + PSM 11)
   const {
     isInitializing,
     initStatusText,
@@ -77,31 +80,49 @@ export const CameraView: React.FC<Props> = ({
     }
   }, [lastScanResult]);
 
+  // Clean up media tracks immediately to release camera indicator on iOS/Android
   const stopTracks = useCallback(() => {
     if (streamRef.current) {
       streamRef.current.getTracks().forEach((track) => {
         try {
           track.stop();
         } catch {
-          // Ignore track stop error
+          // ignore
         }
       });
       streamRef.current = null;
     }
   }, []);
 
+  // Handle visibility change: instantly stop camera on minimize / tab switch
+  useEffect(() => {
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'hidden') {
+        stopTracks();
+      } else if (document.visibilityState === 'visible') {
+        initCamera();
+      }
+    };
+
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    return () => {
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+    };
+  }, [stopTracks]);
+
+  // Initialize Camera Stream strictly with { video: ..., audio: false }
   const initCamera = useCallback(async () => {
     setCameraError(null);
     stopTracks();
 
     try {
       const constraints: MediaStreamConstraints = {
-        audio: false,
+        audio: false, // Strictly no audio recording
         video: {
           facingMode: isFrontCamera ? 'user' : { ideal: 'environment' },
-          width: { ideal: 1280, min: 640 },
-          height: { ideal: 720, min: 480 },
-          // @ts-expect-error focusMode is supported on mobile Chromium
+          width: { ideal: 1920, min: 1280 },
+          height: { ideal: 1080, min: 720 },
+          // @ts-expect-error continuous focus mode
           advanced: [{ focusMode: 'continuous' }],
         },
       };
@@ -114,11 +135,26 @@ export const CameraView: React.FC<Props> = ({
         await videoRef.current.play();
       }
 
+      // Check capabilities for Torch & Hardware Zoom
       const videoTrack = stream.getVideoTracks()[0];
       if (videoTrack) {
         const trackWithCaps = videoTrack as MediaStreamTrack & { getCapabilities?: () => unknown };
-        const capabilities = (typeof trackWithCaps.getCapabilities === 'function' ? trackWithCaps.getCapabilities() : {}) as { torch?: boolean };
+        const capabilities = (typeof trackWithCaps.getCapabilities === 'function' ? trackWithCaps.getCapabilities() : {}) as {
+          torch?: boolean;
+          zoom?: { min: number; max: number; step: number };
+        };
+
         setTorchAvailable(Boolean(capabilities?.torch));
+
+        if (capabilities?.zoom && capabilities.zoom.max > 1) {
+          setHardwareZoomAvailable(true);
+          setZoomMinMax({
+            min: capabilities.zoom.min || 1,
+            max: capabilities.zoom.max || 5,
+          });
+        } else {
+          setHardwareZoomAvailable(false);
+        }
       }
     } catch (err) {
       console.warn('Advanced camera constraints failed, trying basic:', err);
@@ -150,6 +186,7 @@ export const CameraView: React.FC<Props> = ({
     };
   }, [initCamera, stopTracks]);
 
+  // Torch Toggle
   const toggleTorch = async () => {
     if (!streamRef.current || !torchAvailable) return;
     const videoTrack = streamRef.current.getVideoTracks()[0];
@@ -166,16 +203,37 @@ export const CameraView: React.FC<Props> = ({
     }
   };
 
+  // Flip Camera
   const flipCamera = () => {
     setIsFrontCamera((prev) => !prev);
     setIsTorchOn(false);
   };
 
-  // Throttled OCR scanning across the entire camera frame
+  // Apply Hardware / Digital Zoom (1x, 2x, 3x)
+  const applyZoom = async (level: number) => {
+    setZoomLevel(level);
+    if (!streamRef.current) return;
+    const videoTrack = streamRef.current.getVideoTracks()[0];
+
+    if (videoTrack && hardwareZoomAvailable) {
+      try {
+        const clampedZoom = Math.min(zoomMinMax.max, Math.max(zoomMinMax.min, level));
+        await videoTrack.applyConstraints({
+          advanced: [{ zoom: clampedZoom } as MediaTrackConstraintSet & { zoom: number }],
+        });
+      } catch (err) {
+        console.warn('Hardware zoom failed:', err);
+      }
+    }
+  };
+
+  // Fast continuous OCR scanning loop (150ms delay between completed frames)
   useEffect(() => {
     let timer: NodeJS.Timeout;
+    let isCancelled = false;
 
     const runLoop = async () => {
+      if (isCancelled) return;
       const video = videoRef.current;
       const currentItems = activeChecklistRef.current;
 
@@ -184,17 +242,21 @@ export const CameraView: React.FC<Props> = ({
           await scanSource(video, currentItems, matchMode, true, true);
         }
       }
-      timer = setTimeout(runLoop, 650);
+
+      if (!isCancelled) {
+        timer = setTimeout(runLoop, 150);
+      }
     };
 
-    timer = setTimeout(runLoop, 350);
+    timer = setTimeout(runLoop, 200);
 
     return () => {
+      isCancelled = true;
       clearTimeout(timer);
     };
   }, [isInitializing, scanSource, matchMode]);
 
-  // 60 FPS Canvas Highlighting Loop mapping intrinsic video to full-screen cover
+  // 60 FPS Canvas Highlighting Loop with support for Digital / Hardware Zoom mapping
   useEffect(() => {
     let animId: number;
 
@@ -303,94 +365,19 @@ export const CameraView: React.FC<Props> = ({
     };
   }, [isFrontCamera]);
 
+  // Handle "تەواو" (Done) button action on a found item
   const handleMarkItemDone = (item: ChecklistItem) => {
     triggerHaptic(60);
 
     setSuccessToast(t.completedToast(item.text));
     setTimeout(() => {
       setSuccessToast(null);
-    }, 2000);
+    }, 1800);
 
     matchesRef.current = matchesRef.current.filter((w) => w.matchedItemId !== item.id);
     detectedGroupsRef.current = detectedGroupsRef.current.filter((g) => g.item.id !== item.id);
 
     onCompleteItem(item);
-  };
-
-  const captureSnapshot = (targetQueryText?: string) => {
-    const video = videoRef.current;
-    if (!video || video.videoWidth === 0) return;
-
-    const srcW = video.videoWidth;
-    const srcH = video.videoHeight;
-
-    const snapCanvas = document.createElement('canvas');
-    snapCanvas.width = srcW;
-    snapCanvas.height = srcH;
-    const ctx = snapCanvas.getContext('2d');
-    if (!ctx) return;
-
-    if (isFrontCamera) {
-      ctx.translate(srcW, 0);
-      ctx.scale(-1, 1);
-      ctx.drawImage(video, 0, 0, srcW, srcH);
-      ctx.setTransform(1, 0, 0, 1, 0, 0);
-    } else {
-      ctx.drawImage(video, 0, 0, srcW, srcH);
-    }
-
-    const matches = matchesRef.current;
-    for (const m of matches) {
-      let x0 = m.bbox.x0;
-      const y0 = m.bbox.y0;
-      const w = m.bbox.x1 - m.bbox.x0;
-      const h = m.bbox.y1 - m.bbox.y0;
-
-      if (isFrontCamera) {
-        x0 = srcW - (x0 + w);
-      }
-
-      ctx.save();
-      ctx.shadowColor = '#10b981';
-      ctx.shadowBlur = 16;
-      ctx.fillStyle = 'rgba(16, 185, 129, 0.25)';
-      ctx.beginPath();
-      ctx.roundRect(x0 - 4, y0 - 4, w + 8, h + 8, 8);
-      ctx.fill();
-
-      ctx.strokeStyle = '#34d399';
-      ctx.lineWidth = 3.5;
-      ctx.stroke();
-
-      const label = m.matchedItemText || m.text;
-      const badgeText = `${label} (${m.confidence}%)`;
-      ctx.font = 'bold 20px sans-serif';
-      const tw = ctx.measureText(badgeText).width;
-      ctx.fillStyle = 'rgba(10, 12, 18, 0.92)';
-      ctx.beginPath();
-      ctx.roundRect(x0, Math.max(10, y0 - 32), tw + 16, 28, 6);
-      ctx.fill();
-
-      ctx.strokeStyle = '#10b981';
-      ctx.lineWidth = 1.2;
-      ctx.stroke();
-
-      ctx.fillStyle = '#34d399';
-      ctx.fillText(badgeText, x0 + 8, Math.max(30, y0 - 11));
-      ctx.restore();
-    }
-
-    const dataUrl = snapCanvas.toDataURL('image/png');
-    const matchedStrings = matches.map((m) => m.text);
-
-    setSnapshot({
-      imageUrl: dataUrl,
-      timestamp: Date.now(),
-      searchQuery: targetQueryText || checklist.map((i) => i.text).join(', '),
-      matchesCount: matches.length,
-      matchedWords: matchedStrings,
-      fullOcrText: lastScanResult?.fullText || '',
-    });
   };
 
   const handleExit = () => {
@@ -403,21 +390,30 @@ export const CameraView: React.FC<Props> = ({
   const detectedGroups = lastScanResult?.detectedGroups || [];
   const isAllCompleted = checklist.length === 0 && totalCount > 0;
 
+  // If all items completed, stop camera tracks immediately
+  useEffect(() => {
+    if (isAllCompleted) {
+      stopTracks();
+    }
+  }, [isAllCompleted, stopTracks]);
+
   return (
     <div
       ref={containerRef}
       className="fixed inset-0 w-screen h-[100dvh] overflow-hidden bg-black select-none touch-none"
       dir="ltr"
     >
-      {/* Full-Screen Camera View */}
+      {/* Full-Screen Edge-to-Edge Camera View with digital zoom transform fallback */}
       <video
         ref={videoRef}
         autoPlay
         playsInline
         muted
-        className={`fixed inset-0 w-full h-full object-cover transition-transform duration-300 ${
-          isFrontCamera ? 'scale-x-[-1]' : ''
-        }`}
+        style={{
+          transform: `${isFrontCamera ? 'scaleX(-1)' : ''} ${!hardwareZoomAvailable && zoomLevel > 1 ? `scale(${zoomLevel})` : ''}`,
+          transformOrigin: 'center center',
+        }}
+        className="fixed inset-0 w-full h-full object-cover transition-transform duration-200"
       />
 
       {/* Transparent 60fps Full-Screen Canvas Overlay */}
@@ -426,8 +422,8 @@ export const CameraView: React.FC<Props> = ({
         className="fixed inset-0 w-full h-full pointer-events-none z-10"
       />
 
-      {/* TOP FLOATING PILL BAR (iOS Camera Style) */}
-      <div className="absolute top-0 inset-x-0 z-30 p-2.5 pt-safe flex flex-col items-center gap-1.5 pointer-events-auto">
+      {/* 1. TOP FLOATING PILL BAR (Pushed comfortably below iOS Dynamic Island) */}
+      <div className="absolute top-[max(env(safe-area-inset-top,48px),56px)] inset-x-0 z-30 px-3 flex flex-col items-center gap-1.5 pointer-events-auto">
         <div className="inline-flex items-center gap-2 px-3 py-1.5 rounded-full ios-glass shadow-lg">
           {/* Back Button */}
           <button
@@ -438,7 +434,7 @@ export const CameraView: React.FC<Props> = ({
             <ArrowLeft className="w-4 h-4 text-cyan-400" />
           </button>
 
-          {/* Remaining Items Pill & Dropdown Toggle */}
+          {/* Remaining Items Pill */}
           <button
             onClick={() => setShowQueueDropdown((prev) => !prev)}
             className="flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-white/10 hover:bg-white/15 text-white text-xs font-semibold active:scale-95 transition"
@@ -452,7 +448,7 @@ export const CameraView: React.FC<Props> = ({
             />
           </button>
 
-          {/* Torch Button (if supported) */}
+          {/* Torch Button */}
           {torchAvailable && (
             <button
               onClick={toggleTorch}
@@ -540,9 +536,9 @@ export const CameraView: React.FC<Props> = ({
         )}
       </div>
 
-      {/* BOTTOM FLOATING CONTROLS */}
-      <div className="absolute bottom-0 inset-x-0 z-30 pb-safe p-4 flex flex-col items-center gap-3 pointer-events-auto">
-        {/* MATCHED ITEM POPUP CARD (Right above shutter button) */}
+      {/* 2. BOTTOM AREA: Match Cards + 1x/2x/3x Distance Zoom Pill (No shutter button) */}
+      <div className="absolute bottom-0 inset-x-0 z-30 pb-[max(env(safe-area-inset-bottom,16px),20px)] p-4 flex flex-col items-center gap-2.5 pointer-events-auto">
+        {/* MATCHED ITEM POPUP CARD (Appears immediately whenever item detected) */}
         {detectedGroups.length > 0 && !showQueueDropdown && (
           <div
             className="w-full max-w-xs flex flex-col gap-1.5 animate-fade-in"
@@ -551,12 +547,12 @@ export const CameraView: React.FC<Props> = ({
             {detectedGroups.map((group) => (
               <div
                 key={group.item.id}
-                className="flex items-center justify-between gap-2.5 p-2.5 rounded-2xl ios-glass-card border border-emerald-500/50 shadow-[0_0_20px_rgba(16,185,129,0.3)] backdrop-blur-xl"
+                className="flex items-center justify-between gap-2.5 p-3 rounded-2xl ios-glass-card border-2 border-emerald-500 shadow-[0_0_25px_rgba(16,185,129,0.45)] backdrop-blur-xl"
               >
                 <div className="min-w-0 flex-1">
                   <div className="flex items-center gap-1.5">
-                    <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
-                    <h4 className="text-xs font-bold text-white truncate">
+                    <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+                    <h4 className="text-sm font-extrabold text-white truncate">
                       {group.item.text}
                     </h4>
                   </div>
@@ -567,9 +563,9 @@ export const CameraView: React.FC<Props> = ({
 
                 <button
                   onClick={() => handleMarkItemDone(group.item)}
-                  className="px-3.5 py-2 rounded-xl bg-gradient-to-r from-emerald-500 to-teal-400 hover:brightness-110 active:scale-95 text-slate-950 font-black text-xs shadow-md shadow-emerald-500/30 transition-all flex items-center gap-1"
+                  className="px-4 py-2 rounded-xl bg-gradient-to-r from-emerald-500 to-teal-400 hover:brightness-110 active:scale-95 text-slate-950 font-black text-xs sm:text-sm shadow-lg shadow-emerald-500/30 transition-all flex items-center gap-1.5 shrink-0"
                 >
-                  <Check className="w-3.5 h-3.5 stroke-[3]" />
+                  <Check className="w-4 h-4 stroke-[3]" />
                   <span>{t.doneButton}</span>
                 </button>
               </div>
@@ -577,15 +573,21 @@ export const CameraView: React.FC<Props> = ({
           </div>
         )}
 
-        {/* Minimalist Apple/iOS Circular Shutter Button */}
-        <div className="relative flex items-center justify-center">
-          <button
-            onClick={() => captureSnapshot()}
-            aria-label="Capture"
-            className="w-16 h-16 rounded-full border-4 border-white/80 p-1 flex items-center justify-center active:scale-90 transition-transform shadow-lg shadow-black/50"
-          >
-            <div className="w-full h-full rounded-full bg-white active:bg-slate-200 transition" />
-          </button>
+        {/* Distance Zoom Toggle Pill (1x | 2x | 3x) */}
+        <div className="inline-flex items-center rounded-full ios-glass p-0.5 text-xs font-semibold shadow-md">
+          {[1, 2, 3].map((lvl) => (
+            <button
+              key={lvl}
+              onClick={() => applyZoom(lvl)}
+              className={`px-3 py-1 rounded-full transition active:scale-95 ${
+                zoomLevel === lvl
+                  ? 'bg-white text-slate-950 font-bold shadow-sm'
+                  : 'text-slate-300 hover:text-white'
+              }`}
+            >
+              {lvl}x
+            </button>
+          ))}
         </div>
       </div>
 
@@ -609,16 +611,6 @@ export const CameraView: React.FC<Props> = ({
             </button>
           </div>
         </div>
-      )}
-
-      {/* Snapshot Preview Modal */}
-      {snapshot && (
-        <SnapshotModal
-          snapshot={snapshot}
-          t={t}
-          isRtl={isRtl}
-          onClose={() => setSnapshot(null)}
-        />
       )}
 
       {/* Celebratory Completion Overlay */}

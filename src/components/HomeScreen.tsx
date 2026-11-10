@@ -91,11 +91,11 @@ export const HomeScreen: React.FC<Props> = ({
 
   return (
     <div
-      className="w-full h-[100dvh] max-h-[100dvh] overflow-hidden bg-[#07090e] text-slate-100 flex flex-col justify-between p-3 sm:p-4 select-none"
+      className="w-full h-[100dvh] max-h-[100dvh] overflow-hidden bg-[#07090e] text-slate-100 flex flex-col justify-between p-3 sm:p-4 pt-[max(env(safe-area-inset-top,48px),56px)] select-none"
       dir={isRtl ? 'rtl' : 'ltr'}
     >
-      {/* 1. Compact Header */}
-      <header className="shrink-0 flex items-center justify-between gap-2 pt-1 pb-2">
+      {/* 1. Compact Header with Safe Distance from Dynamic Island */}
+      <header className="shrink-0 flex items-center justify-between gap-2 pb-2">
         <div className="flex items-center gap-2">
           <div className="w-7 h-7 rounded-lg bg-gradient-to-tr from-cyan-500 to-emerald-400 flex items-center justify-center shadow-sm">
             <Camera className="w-4 h-4 text-slate-950 stroke-[2.5]" />
@@ -110,9 +110,8 @@ export const HomeScreen: React.FC<Props> = ({
           </div>
         </div>
 
-        {/* Header Right Actions: Install icon + Language Pill */}
+        {/* Header Right Actions */}
         <div className="flex items-center gap-1.5">
-          {/* Subtle Install App Icon */}
           {!isInstalled && (isInstallable || isIOS) && (
             <button
               onClick={handleInstallClick}
@@ -123,7 +122,6 @@ export const HomeScreen: React.FC<Props> = ({
             </button>
           )}
 
-          {/* Minimal Language Switcher Pill */}
           <div className="flex items-center rounded-full ios-glass p-0.5 text-[11px] font-medium">
             <button
               onClick={() => setUiLang('ku')}
@@ -234,10 +232,19 @@ export const HomeScreen: React.FC<Props> = ({
         </div>
       </main>
 
-      {/* 3. Bottom Area: Segmented Language Control + Primary Action Button */}
+      {/* 3. Bottom Area: Segmented OCR Speed Control + Primary Action Button */}
       <footer className="shrink-0 space-y-2 pt-1 pb-safe">
-        {/* Compact Segmented Control for OCR Model */}
         <div className="grid grid-cols-2 p-0.5 rounded-xl ios-glass text-[11px] font-medium text-center">
+          <button
+            onClick={() => setOcrLanguage('eng')}
+            className={`py-1.5 rounded-lg transition ${
+              ocrLanguage === 'eng'
+                ? 'bg-slate-800 text-cyan-300 font-bold shadow-sm'
+                : 'text-slate-400 hover:text-slate-200'
+            }`}
+          >
+            English Fast (3x)
+          </button>
           <button
             onClick={() => setOcrLanguage('eng+ara')}
             className={`py-1.5 rounded-lg transition ${
@@ -248,19 +255,8 @@ export const HomeScreen: React.FC<Props> = ({
           >
             English + کوردی
           </button>
-          <button
-            onClick={() => setOcrLanguage('eng')}
-            className={`py-1.5 rounded-lg transition ${
-              ocrLanguage === 'eng'
-                ? 'bg-slate-800 text-cyan-300 font-bold shadow-sm'
-                : 'text-slate-400 hover:text-slate-200'
-            }`}
-          >
-            English Fast
-          </button>
         </div>
 
-        {/* Primary Start Scanning Button */}
         <button
           onClick={onStartScanning}
           disabled={checklist.length === 0}

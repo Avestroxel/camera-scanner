@@ -46,21 +46,3 @@ export interface ScanResult {
   frameWidth: number;
   frameHeight: number;
 }
-
-export interface SnapshotData {
-  imageUrl: string;
-  timestamp: number;
-  searchQuery: string;
-  matchesCount: number;
-  matchedWords: string[];
-  fullOcrText: string;
-}
-
-export interface CameraSettings {
-  torch: boolean;
-  haptics: boolean;
-  sound: boolean;
-  matchMode: MatchMode;
-  facingMode: 'environment' | 'user';
-  fpsLimit: number;
-}
