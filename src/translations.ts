@@ -80,6 +80,9 @@ export interface Translation {
   markDoneManual: string;
   cameraSees: string;
   ocrStatus: string;
+  autoScan: string;
+  tapToScan: string;
+  tapScreenToScan: string;
 }
 
 export const translations: Record<UILanguage, Translation> = {
@@ -163,6 +166,9 @@ export const translations: Record<UILanguage, Translation> = {
     markDoneManual: 'Mark Done',
     cameraSees: 'Camera sees',
     ocrStatus: 'OCR Status',
+    autoScan: 'Auto (Cool)',
+    tapToScan: 'Tap to Scan',
+    tapScreenToScan: 'Tap screen to scan frame',
   },
   ku: {
     appName: 'گەڕانی دەقی ڕاستەوخۆ',
@@ -244,6 +250,9 @@ export const translations: Record<UILanguage, Translation> = {
     markDoneManual: 'تەواو کرا',
     cameraSees: 'ئەوەی کامێراکە دەیبینێت',
     ocrStatus: 'دۆخی OCR',
+    autoScan: 'خۆکار (Auto)',
+    tapToScan: 'دەستی (Tap)',
+    tapScreenToScan: 'لەسەر شاشەکە داگرە بۆ گەڕان',
   },
   ar: {
     appName: 'الباحث عن النص المباشر',
@@ -325,6 +334,9 @@ export const translations: Record<UILanguage, Translation> = {
     markDoneManual: 'تم',
     cameraSees: 'ما تراه الكاميرا',
     ocrStatus: 'حالة OCR',
+    autoScan: 'تلقائي (Auto)',
+    tapToScan: 'يدوي (Tap)',
+    tapScreenToScan: 'المس الشاشة للمسح',
   },
 };
 

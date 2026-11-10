@@ -142,8 +142,8 @@ export function useOCRScanner(selectedLang: OcrLanguage) {
           return null;
         }
 
-        // High-DPI frame width 1280px to retain small and distant text sharply
-        const targetW = Math.min(1280, srcW);
+        // Lightweight 960px offscreen frame: crisp text with zero thermal throttling
+        const targetW = Math.min(960, srcW);
         const scaleFactor = targetW / srcW;
         const targetH = Math.round(srcH * scaleFactor);
 
@@ -151,36 +151,22 @@ export function useOCRScanner(selectedLang: OcrLanguage) {
           offscreenCanvasRef.current = document.createElement('canvas');
         }
         const canvas = offscreenCanvasRef.current;
-        canvas.width = targetW;
-        canvas.height = targetH;
+        if (canvas.width !== targetW || canvas.height !== targetH) {
+          canvas.width = targetW;
+          canvas.height = targetH;
+        }
 
-        const ctx = canvas.getContext('2d', { willReadFrequently: true });
+        const ctx = canvas.getContext('2d');
         if (!ctx) {
           isBusyRef.current = false;
           setIsProcessing(false);
           return null;
         }
 
+        // Native GPU-accelerated filter: high contrast + grayscale without expensive JS pixel loops
+        ctx.filter = 'contrast(1.4) grayscale(1)';
         ctx.drawImage(source, 0, 0, targetW, targetH);
-
-        // High-contrast grayscale conversion for distance detection
-        try {
-          const imgData = ctx.getImageData(0, 0, targetW, targetH);
-          const data = imgData.data;
-          const contrast = 55; // sharp contrast
-          const factor = (259 * (contrast + 255)) / (255 * (259 - contrast));
-
-          for (let i = 0; i < data.length; i += 4) {
-            const gray = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
-            const enhanced = Math.min(255, Math.max(0, factor * (gray - 128) + 128));
-            data[i] = enhanced;
-            data[i + 1] = enhanced;
-            data[i + 2] = enhanced;
-          }
-          ctx.putImageData(imgData, 0, 0);
-        } catch {
-          // continue with raw canvas if security policy prevents reading
-        }
+        ctx.filter = 'none';
 
         const ret = await workerRef.current.recognize(canvas);
         const rawFullText = (ret.data.text || '').trim();

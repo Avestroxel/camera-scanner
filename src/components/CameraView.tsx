@@ -57,6 +57,10 @@ export const CameraView: React.FC<Props> = ({
   const [hardwareZoomAvailable, setHardwareZoomAvailable] = useState(false);
   const [zoomMinMax, setZoomMinMax] = useState<{ min: number; max: number }>({ min: 1, max: 3 });
 
+  // Thermal optimization: Auto (cool 900ms throttled) vs Manual (0% idle CPU tap-to-scan)
+  const [scanMode, setScanMode] = useState<'auto' | 'manual'>('auto');
+  const [manualScanPulse, setManualScanPulse] = useState(false);
+
   // OCR Hook (Tesseract v5 + PSM 11)
   const {
     isInitializing,
@@ -120,8 +124,9 @@ export const CameraView: React.FC<Props> = ({
         audio: false, // Strictly no audio recording
         video: {
           facingMode: isFrontCamera ? 'user' : { ideal: 'environment' },
-          width: { ideal: 1920, min: 1280 },
-          height: { ideal: 1080, min: 720 },
+          width: { ideal: 1280 },
+          height: { ideal: 720 },
+          frameRate: { ideal: 24, max: 30 },
           // @ts-expect-error continuous focus mode
           advanced: [{ focusMode: 'continuous' }],
         },
@@ -165,6 +170,7 @@ export const CameraView: React.FC<Props> = ({
             facingMode: isFrontCamera ? 'user' : { ideal: 'environment' },
             width: { ideal: 1280 },
             height: { ideal: 720 },
+            frameRate: { ideal: 24, max: 30 },
           },
         });
         streamRef.current = fallbackStream;
@@ -227,13 +233,27 @@ export const CameraView: React.FC<Props> = ({
     }
   };
 
-  // Fast continuous OCR scanning loop (150ms delay between completed frames)
+  // Manual scan trigger (called on viewfinder tap in manual mode or via button)
+  const triggerManualScan = useCallback(async () => {
+    const video = videoRef.current;
+    const currentItems = activeChecklistRef.current;
+    if (video && !isInitializing && currentItems.length > 0) {
+      if (video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA && video.videoWidth > 0) {
+        setManualScanPulse(true);
+        triggerHaptic(40);
+        await scanSource(video, currentItems, matchMode, true, true);
+        setTimeout(() => setManualScanPulse(false), 500);
+      }
+    }
+  }, [isInitializing, matchMode, scanSource]);
+
+  // Throttled OCR scanning loop (Cool CPU Mode: 900ms between completed frames in auto mode)
   useEffect(() => {
     let timer: NodeJS.Timeout;
     let isCancelled = false;
 
     const runLoop = async () => {
-      if (isCancelled) return;
+      if (isCancelled || scanMode !== 'auto') return;
       const video = videoRef.current;
       const currentItems = activeChecklistRef.current;
 
@@ -243,18 +263,21 @@ export const CameraView: React.FC<Props> = ({
         }
       }
 
-      if (!isCancelled) {
-        timer = setTimeout(runLoop, 150);
+      if (!isCancelled && scanMode === 'auto') {
+        // 900ms cool interval stops mobile CPU thermal throttling
+        timer = setTimeout(runLoop, 900);
       }
     };
 
-    timer = setTimeout(runLoop, 200);
+    if (scanMode === 'auto') {
+      timer = setTimeout(runLoop, 400);
+    }
 
     return () => {
       isCancelled = true;
       clearTimeout(timer);
     };
-  }, [isInitializing, scanSource, matchMode]);
+  }, [isInitializing, scanSource, matchMode, scanMode]);
 
   // 60 FPS Canvas Highlighting Loop with support for Digital / Hardware Zoom mapping
   useEffect(() => {
@@ -400,7 +423,10 @@ export const CameraView: React.FC<Props> = ({
   return (
     <div
       ref={containerRef}
-      className="fixed inset-0 w-screen h-[100dvh] overflow-hidden bg-black select-none touch-none"
+      onClick={scanMode === 'manual' ? triggerManualScan : undefined}
+      className={`fixed inset-0 w-screen h-[100dvh] overflow-hidden bg-black select-none touch-none transition-all duration-300 ${
+        manualScanPulse ? 'ring-4 ring-inset ring-amber-400/60' : ''
+      }`}
       dir="ltr"
     >
       {/* Full-Screen Edge-to-Edge Camera View with digital zoom transform fallback */}
@@ -422,9 +448,9 @@ export const CameraView: React.FC<Props> = ({
         className="fixed inset-0 w-full h-full pointer-events-none z-10"
       />
 
-      {/* 1. TOP FLOATING PILL BAR (Pushed comfortably below iOS Dynamic Island) */}
-      <div className="absolute top-[max(env(safe-area-inset-top,48px),56px)] inset-x-0 z-30 px-3 flex flex-col items-center gap-1.5 pointer-events-auto">
-        <div className="inline-flex items-center gap-2 px-3 py-1.5 rounded-full ios-glass shadow-lg">
+      {/* 1. TOP FLOATING PILL BAR (Pushed comfortably down to top-20, clear of Dynamic Island) */}
+      <div className="absolute top-20 inset-x-0 z-30 px-3 flex flex-col items-center gap-1.5 pointer-events-auto">
+        <div className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-full ios-glass shadow-lg">
           {/* Back Button */}
           <button
             onClick={handleExit}
@@ -437,7 +463,7 @@ export const CameraView: React.FC<Props> = ({
           {/* Remaining Items Pill */}
           <button
             onClick={() => setShowQueueDropdown((prev) => !prev)}
-            className="flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-white/10 hover:bg-white/15 text-white text-xs font-semibold active:scale-95 transition"
+            className="flex items-center gap-1 px-2 py-0.5 rounded-full bg-white/10 hover:bg-white/15 text-white text-xs font-semibold active:scale-95 transition"
             dir={isRtl ? 'rtl' : 'ltr'}
           >
             <span>{t.remainingItems}: {remainingCount}</span>
@@ -447,6 +473,30 @@ export const CameraView: React.FC<Props> = ({
               }`}
             />
           </button>
+
+          {/* Thermal Optimization Mode: Auto (Cool 900ms) vs Tap (0% idle CPU) */}
+          <div className="flex items-center rounded-full bg-black/40 p-0.5 text-[10px] font-semibold border border-white/10">
+            <button
+              onClick={() => setScanMode('auto')}
+              className={`px-2 py-0.5 rounded-full transition active:scale-95 ${
+                scanMode === 'auto'
+                  ? 'bg-cyan-500 text-slate-950 font-bold shadow-sm'
+                  : 'text-slate-400 hover:text-white'
+              }`}
+            >
+              {t.autoScan}
+            </button>
+            <button
+              onClick={() => setScanMode('manual')}
+              className={`px-2 py-0.5 rounded-full transition active:scale-95 ${
+                scanMode === 'manual'
+                  ? 'bg-amber-400 text-slate-950 font-bold shadow-sm'
+                  : 'text-slate-400 hover:text-white'
+              }`}
+            >
+              {t.tapToScan}
+            </button>
+          </div>
 
           {/* Torch Button */}
           {torchAvailable && (
@@ -571,6 +621,19 @@ export const CameraView: React.FC<Props> = ({
               </div>
             ))}
           </div>
+        )}
+
+        {/* Manual Tap-to-Scan Floating Prompt when in manual mode */}
+        {scanMode === 'manual' && detectedGroups.length === 0 && (
+          <button
+            onClick={triggerManualScan}
+            className={`px-3.5 py-1.5 rounded-full ios-glass text-xs font-semibold text-amber-300 border border-amber-400/30 flex items-center gap-1.5 shadow-lg active:scale-95 transition ${
+              manualScanPulse ? 'bg-amber-400/20' : ''
+            }`}
+          >
+            <span className="w-2 h-2 rounded-full bg-amber-400 animate-ping" />
+            <span>{t.tapScreenToScan}</span>
+          </button>
         )}
 
         {/* Distance Zoom Toggle Pill (1x | 2x | 3x) */}

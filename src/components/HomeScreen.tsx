@@ -91,7 +91,7 @@ export const HomeScreen: React.FC<Props> = ({
 
   return (
     <div
-      className="w-full h-[100dvh] max-h-[100dvh] overflow-hidden bg-[#07090e] text-slate-100 flex flex-col justify-between p-3 sm:p-4 pt-[max(env(safe-area-inset-top,48px),56px)] select-none"
+      className="w-full h-[100dvh] max-h-[100dvh] overflow-hidden bg-[#07090e] text-slate-100 flex flex-col justify-between p-3 sm:p-4 pt-24 select-none"
       dir={isRtl ? 'rtl' : 'ltr'}
     >
       {/* 1. Compact Header with Safe Distance from Dynamic Island */}
