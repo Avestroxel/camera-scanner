@@ -78,6 +78,8 @@ export interface Translation {
   emptyQueueTip: string;
   completedItemsHistory: string;
   markDoneManual: string;
+  cameraSees: string;
+  ocrStatus: string;
 }
 
 export const translations: Record<UILanguage, Translation> = {
@@ -159,6 +161,8 @@ export const translations: Record<UILanguage, Translation> = {
     emptyQueueTip: 'Add item above or tap popular chips below',
     completedItemsHistory: 'Completed in this session',
     markDoneManual: 'Mark Done',
+    cameraSees: 'Camera sees',
+    ocrStatus: 'OCR Status',
   },
   ku: {
     appName: 'گەڕانی دەقی ڕاستەوخۆ',
@@ -238,6 +242,8 @@ export const translations: Record<UILanguage, Translation> = {
     emptyQueueTip: 'لە سەرەوە بنووسە یان لە پێشنیارەکانی خوارەوە هەڵبژێرە',
     completedItemsHistory: 'تەواوکراوەکانی ئەمجارە',
     markDoneManual: 'تەواو کرا',
+    cameraSees: 'ئەوەی کامێراکە دەیبینێت',
+    ocrStatus: 'دۆخی OCR',
   },
   ar: {
     appName: 'الباحث عن النص المباشر',
@@ -317,6 +323,8 @@ export const translations: Record<UILanguage, Translation> = {
     emptyQueueTip: 'اكتب في الحقل أعلاه أو اختر من الاقتراحات السريعة',
     completedItemsHistory: 'العناصر المكتملة في هذه الجلسة',
     markDoneManual: 'تم',
+    cameraSees: 'ما تراه الكاميرا',
+    ocrStatus: 'حالة OCR',
   },
 };
 

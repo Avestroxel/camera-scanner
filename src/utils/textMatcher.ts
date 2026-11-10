@@ -1,12 +1,22 @@
 import { MatchMode } from '../types';
 
 /**
+ * Strips all spaces, symbols, and punctuation, preserving alphanumeric
+ * characters in English, Arabic, and Kurdish.
+ */
+export function cleanAlphanumeric(input: string): string {
+  if (!input) return '';
+  return input
+    .toLowerCase()
+    .replace(/[^a-z0-9\u0600-\u06FF]/gu, '');
+}
+
+/**
  * Normalizes text across English, Arabic, and Kurdish scripts:
  * - Trims and lowercases
  * - Unifies Kurdish/Persian and Arabic glyph variants (ی -> ي, ک -> ك, ە -> ه)
  * - Removes Arabic/Kurdish diacritics (tashkeel, harakat, tatweel)
  * - Normalizes Eastern/Arabic digits (٠-٩, ۰-۹) to standard digits (0-9)
- * - Strips common surrounding punctuation marks
  */
 export function normalizeText(input: string): string {
   if (!input) return '';
@@ -35,9 +45,6 @@ export function normalizeText(input: string): string {
              .replace(/[إأآا]/g, 'ا')
              .replace(/[ۆؤ]/g, 'و');
 
-  // Strip leading/trailing punctuation but keep numbers, letters and internal hyphens/dots
-  text = text.replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, '');
-
   return text;
 }
 
@@ -56,9 +63,9 @@ function levenshteinDistance(s1: string, s2: string): number {
     for (let j = 1; j <= n; j++) {
       const cost = s1[i - 1] === s2[j - 1] ? 0 : 1;
       dp[i][j] = Math.min(
-        dp[i - 1][j] + 1,      // deletion
-        dp[i][j - 1] + 1,      // insertion
-        dp[i - 1][j - 1] + cost // substitution
+        dp[i - 1][j] + 1,
+        dp[i][j - 1] + 1,
+        dp[i - 1][j - 1] + cost
       );
     }
   }
@@ -67,22 +74,33 @@ function levenshteinDistance(s1: string, s2: string): number {
 }
 
 /**
- * Evaluates whether an OCR detected token matches the target query
+ * Evaluates whether an OCR detected token (word or line) matches the target query
  */
 export function checkMatch(
   detectedRaw: string,
   targetRaw: string,
   mode: MatchMode
 ): { isMatch: boolean; score: number } {
-  const targetNorm = normalizeText(targetRaw);
-  const detectedNorm = normalizeText(detectedRaw);
-
-  if (!targetNorm || !detectedNorm) {
+  if (!detectedRaw || !targetRaw) {
     return { isMatch: false, score: 0 };
   }
 
-  // Exact match
-  if (detectedNorm === targetNorm) {
+  const cleanTarget = cleanAlphanumeric(targetRaw);
+  const cleanDetected = cleanAlphanumeric(detectedRaw);
+
+  if (!cleanTarget || !cleanDetected) {
+    return { isMatch: false, score: 0 };
+  }
+
+  // Exact alphanumeric match
+  if (cleanDetected === cleanTarget) {
+    return { isMatch: true, score: 1.0 };
+  }
+
+  // Exact normalized match (taking into account Kurdish/Arabic letter unification)
+  const normTarget = normalizeText(cleanTarget);
+  const normDetected = normalizeText(cleanDetected);
+  if (normDetected === normTarget) {
     return { isMatch: true, score: 1.0 };
   }
 
@@ -90,20 +108,21 @@ export function checkMatch(
     return { isMatch: false, score: 0 };
   }
 
-  // Contains match (either detected contains target, or target contains detected for split words)
-  if (detectedNorm.includes(targetNorm)) {
-    return { isMatch: true, score: 0.9 };
+  // Substring match: detected text contains target (e.g. line contains "total" or "52.71")
+  if (normDetected.includes(normTarget)) {
+    return { isMatch: true, score: 0.95 };
   }
 
-  if (targetNorm.length >= 4 && targetNorm.includes(detectedNorm) && detectedNorm.length >= 3) {
-    return { isMatch: true, score: 0.8 };
+  // Or target contains detected if word is split (at least 3 characters)
+  if (normTarget.length >= 4 && normTarget.includes(normDetected) && normDetected.length >= 3) {
+    return { isMatch: true, score: 0.85 };
   }
 
   // Fuzzy match
   if (mode === 'fuzzy') {
-    const maxLen = Math.max(detectedNorm.length, targetNorm.length);
+    const maxLen = Math.max(normDetected.length, normTarget.length);
     if (maxLen >= 3) {
-      const dist = levenshteinDistance(detectedNorm, targetNorm);
+      const dist = levenshteinDistance(normDetected, normTarget);
       const similarity = 1 - dist / maxLen;
 
       // Allow 1 typo for 3-5 chars, 2 typos for 6+ chars

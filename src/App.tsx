@@ -34,12 +34,11 @@ export default function App() {
   const [completedItems, setCompletedItems] = useState<ChecklistItem[]>([]);
   const [initialTotalCount, setInitialTotalCount] = useState<number>(() => checklist.length);
   const [ocrLanguage, setOcrLanguage] = useState<OcrLanguage>('eng+ara');
-  const [matchMode, setMatchMode] = useState<MatchMode>('contains');
-  const [uiLang, setUiLang] = useState<UILanguage>('en');
-  const [initialImage, setInitialImage] = useState<string | null>(null);
+  const [matchMode] = useState<MatchMode>('contains'); // Always use smart flexible/contains matching
+  const [uiLang, setUiLang] = useState<UILanguage>('ku'); // Default to Kurdish as requested
 
   const isOnline = useOnlineStatus();
-  const t = translations[uiLang] || translations.en;
+  const t = translations[uiLang] || translations.ku || translations.en;
   const isRtl = uiLang === 'ku' || uiLang === 'ar';
 
   // Synchronize checklist with localStorage
@@ -95,11 +94,9 @@ export default function App() {
   const handleStartScanning = () => {
     setCompletedItems([]);
     setInitialTotalCount(checklist.length);
-    setInitialImage(null);
     setCurrentView('scanner');
   };
 
-  // Called when user taps "تەواو" (Done) on an item from the camera screen
   const handleCompleteItem = (item: ChecklistItem) => {
     setChecklist((prev) => prev.filter((i) => i.id !== item.id));
     setCompletedItems((prev) => [
@@ -108,20 +105,18 @@ export default function App() {
     ]);
   };
 
-  // Restart batch after all items are completed
   const handleRestartBatch = () => {
     setChecklist(DEFAULT_ITEMS);
     setCompletedItems([]);
-    setInitialImage(null);
     setCurrentView('home');
   };
 
   return (
-    <main className="w-full h-full min-h-[100dvh] relative overflow-hidden bg-[#090d16] font-sans antialiased">
+    <main className="w-full h-[100dvh] max-h-[100dvh] relative overflow-hidden bg-[#07090e] font-sans antialiased">
       {/* Offline Status Toast */}
       {!isOnline && (
-        <div className="fixed top-3 left-1/2 -translate-x-1/2 z-50 flex items-center gap-2 px-3 py-1.5 rounded-full bg-amber-500/90 text-slate-950 font-bold text-xs shadow-lg backdrop-blur-md animate-bounce">
-          <WifiOff className="w-3.5 h-3.5" />
+        <div className="fixed top-2 left-1/2 -translate-x-1/2 z-50 flex items-center gap-1.5 px-3 py-1 rounded-full bg-amber-500/90 text-slate-950 font-bold text-[11px] shadow-lg backdrop-blur-md">
+          <WifiOff className="w-3 h-3" />
           <span>{t.offlineBanner}</span>
         </div>
       )}
@@ -135,19 +130,11 @@ export default function App() {
           onClearAll={handleClearAll}
           ocrLanguage={ocrLanguage}
           setOcrLanguage={setOcrLanguage}
-          matchMode={matchMode}
-          setMatchMode={setMatchMode}
           uiLang={uiLang}
           setUiLang={setUiLang}
           t={t}
           isRtl={isRtl}
           onStartScanning={handleStartScanning}
-          onSelectSampleImage={(dataUrl) => {
-            setCompletedItems([]);
-            setInitialTotalCount(checklist.length);
-            setInitialImage(dataUrl);
-            setCurrentView('scanner');
-          }}
         />
       ) : (
         <CameraView
@@ -158,11 +145,7 @@ export default function App() {
           matchMode={matchMode}
           t={t}
           isRtl={isRtl}
-          initialImageSrc={initialImage}
-          onBack={() => {
-            setInitialImage(null);
-            setCurrentView('home');
-          }}
+          onBack={() => setCurrentView('home')}
           onCompleteItem={handleCompleteItem}
           onRestartBatch={handleRestartBatch}
         />
