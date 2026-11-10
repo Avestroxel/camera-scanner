@@ -74,6 +74,7 @@ export const CameraView: React.FC<Props> = ({
 
   const matchesRef = useRef<MatchedWord[]>([]);
   const detectedGroupsRef = useRef<DetectedMatchGroup[]>([]);
+  const scanDimsRef = useRef<{ w: number; h: number }>({ w: 0, h: 0 });
   const activeChecklistRef = useRef<ChecklistItem[]>(checklist);
   activeChecklistRef.current = checklist;
 
@@ -81,6 +82,10 @@ export const CameraView: React.FC<Props> = ({
     if (lastScanResult) {
       matchesRef.current = lastScanResult.matchedWords;
       detectedGroupsRef.current = lastScanResult.detectedGroups;
+      scanDimsRef.current = {
+        w: lastScanResult.frameWidth,
+        h: lastScanResult.frameHeight,
+      };
     }
   }, [lastScanResult]);
 
@@ -279,7 +284,7 @@ export const CameraView: React.FC<Props> = ({
     };
   }, [isInitializing, scanSource, matchMode, scanMode]);
 
-  // 60 FPS Canvas Highlighting Loop with support for Digital / Hardware Zoom mapping
+  // 60 FPS Word-Level Bounding Box Renderer with exact object-fit: cover coordinate mapping
   useEffect(() => {
     let animId: number;
 
@@ -289,89 +294,73 @@ export const CameraView: React.FC<Props> = ({
       const video = videoRef.current;
 
       if (canvas && container && video) {
-        const sW = container.clientWidth;
-        const sH = container.clientHeight;
+        const rect = video.getBoundingClientRect();
+        const screenW = rect.width || container.clientWidth;
+        const screenH = rect.height || container.clientHeight;
+        const dpr = window.devicePixelRatio || 1;
 
-        if (canvas.width !== sW || canvas.height !== sH) {
-          canvas.width = sW;
-          canvas.height = sH;
+        const targetCanvasW = Math.round(screenW * dpr);
+        const targetCanvasH = Math.round(screenH * dpr);
+
+        if (canvas.width !== targetCanvasW || canvas.height !== targetCanvasH) {
+          canvas.width = targetCanvasW;
+          canvas.height = targetCanvasH;
         }
 
         const ctx = canvas.getContext('2d');
         if (ctx) {
-          ctx.clearRect(0, 0, sW, sH);
+          ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+          ctx.clearRect(0, 0, screenW, screenH);
 
-          const vW = video.videoWidth;
-          const vH = video.videoHeight;
+          const srcW = scanDimsRef.current.w || video.videoWidth;
+          const srcH = scanDimsRef.current.h || video.videoHeight;
 
-          if (vW > 0 && vH > 0) {
-            const scale = Math.max(sW / vW, sH / vH);
-            const renderW = vW * scale;
-            const renderH = vH * scale;
-            const offsetX = (sW - renderW) / 2;
-            const offsetY = (sH - renderH) / 2;
+          if (srcW > 0 && srcH > 0 && screenW > 0 && screenH > 0) {
+            const effectiveZoom = !hardwareZoomAvailable && zoomLevel > 1 ? zoomLevel : 1;
+            const scale = Math.max(screenW / srcW, screenH / srcH) * effectiveZoom;
+            const renderedW = srcW * scale;
+            const renderedH = srcH * scale;
+            const offsetX = (screenW - renderedW) / 2;
+            const offsetY = (screenH - renderedH) / 2;
 
             const matches = matchesRef.current;
             const time = performance.now() * 0.003;
 
             for (let i = 0; i < matches.length; i++) {
               const m = matches[i];
-              let x0 = m.bbox.x0 * scale + offsetX;
-              const y0 = m.bbox.y0 * scale + offsetY;
-              const bW = (m.bbox.x1 - m.bbox.x0) * scale;
-              const bH = (m.bbox.y1 - m.bbox.y0) * scale;
+              let boxX = m.bbox.x0 * scale + offsetX;
+              const boxY = m.bbox.y0 * scale + offsetY;
+              const boxW = (m.bbox.x1 - m.bbox.x0) * scale;
+              const boxH = (m.bbox.y1 - m.bbox.y0) * scale;
 
               if (isFrontCamera) {
-                x0 = sW - (x0 + bW);
+                boxX = screenW - (boxX + boxW);
               }
 
-              const padX = Math.max(3, bW * 0.08);
-              const padY = Math.max(3, bH * 0.12);
-              const rx = x0 - padX;
-              const ry = y0 - padY;
-              const rw = bW + padX * 2;
-              const rh = bH + padY * 2;
+              // Tight padding around the exact matched word (never overlapping surrounding lines)
+              const padX = 3;
+              const padY = 2;
+              const rx = boxX - padX;
+              const ry = boxY - padY;
+              const rw = boxW + padX * 2;
+              const rh = boxH + padY * 2;
 
-              const pulse = 0.88 + Math.sin(time * 3.5 + i) * 0.12;
+              const pulse = 0.9 + Math.sin(time * 3.5 + i) * 0.1;
 
               ctx.save();
               ctx.shadowColor = '#10b981';
-              ctx.shadowBlur = 12 * pulse;
+              ctx.shadowBlur = 10 * pulse;
 
-              // Translucent green highlight fill
-              ctx.fillStyle = `rgba(16, 185, 129, ${0.2 * pulse})`;
+              // Subtle translucent emerald highlight fill so the text underneath stays 100% readable
+              ctx.fillStyle = `rgba(16, 185, 129, ${0.18 * pulse})`;
               ctx.beginPath();
-              ctx.roundRect(rx, ry, rw, rh, 6);
+              ctx.roundRect(rx, ry, rw, rh, 4);
               ctx.fill();
 
-              // Glowing border stroke
-              ctx.strokeStyle = `rgba(52, 211, 153, ${0.9 * pulse})`;
+              // Crisp glowing border stroke around ONLY the word
+              ctx.strokeStyle = `rgba(52, 211, 153, ${0.95 * pulse})`;
               ctx.lineWidth = 2;
               ctx.stroke();
-
-              // Floating pill badge displaying target item text and match confidence
-              const displayLabel = m.matchedItemText || m.text;
-              const badgeText = `${displayLabel} • ${m.confidence}%`;
-              ctx.font = 'bold 10px sans-serif';
-              const textMetrics = ctx.measureText(badgeText);
-              const pillW = textMetrics.width + 12;
-              const pillH = 17;
-              const pillX = Math.max(4, Math.min(sW - pillW - 4, rx + (rw - pillW) / 2));
-              const pillY = Math.max(4, ry - pillH - 3);
-
-              ctx.shadowBlur = 4;
-              ctx.shadowColor = '#06b6d4';
-              ctx.fillStyle = 'rgba(10, 12, 18, 0.88)';
-              ctx.beginPath();
-              ctx.roundRect(pillX, pillY, pillW, pillH, 5);
-              ctx.fill();
-
-              ctx.strokeStyle = '#34d399';
-              ctx.lineWidth = 0.8;
-              ctx.stroke();
-
-              ctx.fillStyle = '#34d399';
-              ctx.fillText(badgeText, pillX + 6, pillY + 12);
 
               ctx.restore();
             }
@@ -386,7 +375,7 @@ export const CameraView: React.FC<Props> = ({
     return () => {
       cancelAnimationFrame(animId);
     };
-  }, [isFrontCamera]);
+  }, [isFrontCamera, hardwareZoomAvailable, zoomLevel]);
 
   // Handle "تەواو" (Done) button action on a found item
   const handleMarkItemDone = (item: ChecklistItem) => {
@@ -439,13 +428,13 @@ export const CameraView: React.FC<Props> = ({
           transform: `${isFrontCamera ? 'scaleX(-1)' : ''} ${!hardwareZoomAvailable && zoomLevel > 1 ? `scale(${zoomLevel})` : ''}`,
           transformOrigin: 'center center',
         }}
-        className="fixed inset-0 w-full h-full object-cover transition-transform duration-200"
+        className="absolute inset-0 w-full h-full object-cover transition-transform duration-200"
       />
 
       {/* Transparent 60fps Full-Screen Canvas Overlay */}
       <canvas
         ref={canvasRef}
-        className="fixed inset-0 w-full h-full pointer-events-none z-10"
+        className="absolute inset-0 w-full h-full pointer-events-none z-10"
       />
 
       {/* 1. TOP FLOATING PILL BAR (Pushed comfortably down to top-20, clear of Dynamic Island) */}

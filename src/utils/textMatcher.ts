@@ -74,7 +74,8 @@ function levenshteinDistance(s1: string, s2: string): number {
 }
 
 /**
- * Evaluates whether an OCR detected token (word or line) matches the target query
+ * Evaluates whether an OCR detected word (or multi-word slice) matches the target query.
+ * Includes smart tolerance for faint/small text OCR character confusions.
  */
 export function checkMatch(
   detectedRaw: string,
@@ -92,12 +93,12 @@ export function checkMatch(
     return { isMatch: false, score: 0 };
   }
 
-  // Exact alphanumeric match
+  // 1. Exact alphanumeric match
   if (cleanDetected === cleanTarget) {
     return { isMatch: true, score: 1.0 };
   }
 
-  // Exact normalized match (taking into account Kurdish/Arabic letter unification)
+  // 2. Exact normalized match (Kurdish/Arabic letter unification + digits)
   const normTarget = normalizeText(cleanTarget);
   const normDetected = normalizeText(cleanDetected);
   if (normDetected === normTarget) {
@@ -108,30 +109,33 @@ export function checkMatch(
     return { isMatch: false, score: 0 };
   }
 
-  // Substring match: detected text contains target (e.g. line contains "total" or "52.71")
+  // 3. Substring match within a single word token (e.g., "$52.71" or "INV-204" when searching "52.71" or "204")
   if (normDetected.includes(normTarget)) {
     return { isMatch: true, score: 0.95 };
   }
 
-  // Or target contains detected if word is split (at least 3 characters)
-  if (normTarget.length >= 4 && normTarget.includes(normDetected) && normDetected.length >= 3) {
-    return { isMatch: true, score: 0.85 };
+  // 4. Smart OCR tolerance for faint/small text (1-char OCR confusion on words >= 4 chars, e.g. '0' vs 'o', '1' vs 'l')
+  const lenDiff = Math.abs(normDetected.length - normTarget.length);
+  const maxLen = Math.max(normDetected.length, normTarget.length);
+  if (maxLen >= 4 && lenDiff <= 1) {
+    const dist = levenshteinDistance(normDetected, normTarget);
+    const allowedTypos = maxLen >= 7 ? 2 : 1;
+    if (dist <= allowedTypos) {
+      const similarity = 1 - dist / maxLen;
+      return { isMatch: true, score: Math.max(0.82, Number(similarity.toFixed(2))) };
+    }
   }
 
-  // Fuzzy match
-  if (mode === 'fuzzy') {
-    const maxLen = Math.max(normDetected.length, normTarget.length);
-    if (maxLen >= 3) {
-      const dist = levenshteinDistance(normDetected, normTarget);
-      const similarity = 1 - dist / maxLen;
-
-      // Allow 1 typo for 3-5 chars, 2 typos for 6+ chars
-      const threshold = maxLen <= 4 ? 0.75 : maxLen <= 7 ? 0.70 : 0.65;
-      if (similarity >= threshold) {
-        return { isMatch: true, score: similarity };
-      }
+  // 5. Explicit fuzzy mode for wider tolerance
+  if (mode === 'fuzzy' && maxLen >= 3) {
+    const dist = levenshteinDistance(normDetected, normTarget);
+    const similarity = 1 - dist / maxLen;
+    const threshold = maxLen <= 4 ? 0.75 : maxLen <= 7 ? 0.70 : 0.65;
+    if (similarity >= threshold) {
+      return { isMatch: true, score: similarity };
     }
   }
 
   return { isMatch: false, score: 0 };
 }
+

@@ -1,8 +1,15 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { createWorker, Worker, PSM } from 'tesseract.js';
 import { OcrLanguage, MatchMode, MatchedWord, ScanResult, ChecklistItem, DetectedMatchGroup } from '../types';
-import { checkMatch } from '../utils/textMatcher';
+import { checkMatch, cleanAlphanumeric, normalizeText } from '../utils/textMatcher';
 import { triggerHaptic, playMatchChime } from '../utils/audioAlert';
+
+interface RawOCRWord {
+  text: string;
+  confidence: number;
+  bbox: { x0: number; y0: number; x1: number; y1: number };
+  lineIndex: number;
+}
 
 export function useOCRScanner(selectedLang: OcrLanguage) {
   const [isInitializing, setIsInitializing] = useState(true);
@@ -20,7 +27,7 @@ export function useOCRScanner(selectedLang: OcrLanguage) {
   const isBusyRef = useRef(false);
   const previousMatchedItemIdsRef = useRef<Set<string>>(new Set());
 
-  // Initialize or reinitialize Tesseract v5 worker with PSM 11 (Sparse text)
+  // Initialize or reinitialize Tesseract v5 worker with PSM 11 (Sparse text for fine/faint text)
   useEffect(() => {
     let isCancelled = false;
     activeLangRef.current = selectedLang;
@@ -64,10 +71,10 @@ export function useOCRScanner(selectedLang: OcrLanguage) {
           return;
         }
 
-        // Configure parameters for maximum real-time speed on sparse text & codes at distance
-        // PSM 11 = Sparse text (Find as much text as possible in no particular order)
+        // PSM 11 = Sparse text: finds small, faint, and isolated words accurately across the frame
         await worker.setParameters({
           tessedit_pageseg_mode: PSM.SPARSE_TEXT,
+          preserve_interword_spaces: '1',
         });
 
         workerRef.current = worker;
@@ -99,7 +106,41 @@ export function useOCRScanner(selectedLang: OcrLanguage) {
     };
   }, [selectedLang]);
 
-  // Main scan function: High-DPI 1280px canvas with contrast boost for distance accuracy
+  /**
+   * If an OCR word token contains extra prefix/suffix characters around the target word
+   * (e.g. "item:Recording" or "123-Recording" when searching "Recording"),
+   * slice the bounding box horizontally to wrap ONLY the matched target characters.
+   */
+  const tightenWordBbox = (
+    bbox: { x0: number; y0: number; x1: number; y1: number },
+    detectedText: string,
+    targetText: string
+  ) => {
+    const normDetected = normalizeText(cleanAlphanumeric(detectedText));
+    const normTarget = normalizeText(cleanAlphanumeric(targetText));
+
+    if (
+      normDetected.length > normTarget.length + 1 &&
+      normTarget.length >= 2 &&
+      normDetected.includes(normTarget)
+    ) {
+      const idx = normDetected.indexOf(normTarget);
+      if (idx >= 0) {
+        const totalWidth = bbox.x1 - bbox.x0;
+        const startRatio = idx / normDetected.length;
+        const endRatio = (idx + normTarget.length) / normDetected.length;
+        return {
+          x0: bbox.x0 + totalWidth * startRatio,
+          y0: bbox.y0,
+          x1: bbox.x0 + totalWidth * endRatio,
+          y1: bbox.y1,
+        };
+      }
+    }
+    return bbox;
+  };
+
+  // Main scan function: High-clarity 1280px pipeline for faint & fine text + strict word-level bbox extraction
   const scanSource = useCallback(
     async (
       source: HTMLVideoElement | HTMLCanvasElement | HTMLImageElement,
@@ -142,10 +183,11 @@ export function useOCRScanner(selectedLang: OcrLanguage) {
           return null;
         }
 
-        // Lightweight 960px offscreen frame: crisp text with zero thermal throttling
-        const targetW = Math.min(960, srcW);
-        const scaleFactor = targetW / srcW;
-        const targetH = Math.round(srcH * scaleFactor);
+        // Preserve full 1280px detail (and upscale low-res frames to 1280px) so small/fine text is crisp
+        const targetW = srcW < 1280 ? 1280 : Math.min(1440, srcW);
+        const scaleX = targetW / srcW;
+        const targetH = Math.round(srcH * scaleX);
+        const scaleY = targetH / srcH;
 
         if (!offscreenCanvasRef.current) {
           offscreenCanvasRef.current = document.createElement('canvas');
@@ -163,8 +205,10 @@ export function useOCRScanner(selectedLang: OcrLanguage) {
           return null;
         }
 
-        // Native GPU-accelerated filter: high contrast + grayscale without expensive JS pixel loops
-        ctx.filter = 'contrast(1.4) grayscale(1)';
+        // High-quality bicubic-like smoothing + GPU contrast/brightness boost for faint & fine text
+        ctx.imageSmoothingEnabled = true;
+        ctx.imageSmoothingQuality = 'high';
+        ctx.filter = 'grayscale(1) contrast(1.75) brightness(1.06)';
         ctx.drawImage(source, 0, 0, targetW, targetH);
         ctx.filter = 'none';
 
@@ -175,63 +219,60 @@ export function useOCRScanner(selectedLang: OcrLanguage) {
         const sanitizedPreview = rawFullText.replace(/\s+/g, ' ').slice(0, 50);
         setRawTextPreview(sanitizedPreview);
 
-        interface ExtractedToken {
-          text: string;
-          confidence: number;
-          bbox: { x0: number; y0: number; x1: number; y1: number };
-          isLine: boolean;
-        }
-        const extractedTokens: ExtractedToken[] = [];
+        // Extract STRICTLY word-level tokens (NEVER whole line.bbox!)
+        const rawWords: RawOCRWord[] = [];
+        let lineCounter = 0;
 
-        // Lines and Words from Tesseract result
         if (ret.data.lines && ret.data.lines.length > 0) {
           for (const line of ret.data.lines) {
-            if (line.text && line.text.trim().length > 0) {
-              extractedTokens.push({
-                text: line.text.trim(),
-                confidence: Math.round(line.confidence || 0),
-                bbox: line.bbox,
-                isLine: true,
-              });
-
-              if (line.words) {
-                for (const w of line.words) {
-                  if (w.text && w.text.trim().length > 0) {
-                    extractedTokens.push({
-                      text: w.text.trim(),
-                      confidence: Math.round(w.confidence || 0),
-                      bbox: w.bbox,
-                      isLine: false,
-                    });
-                  }
+            lineCounter++;
+            if (line.words && line.words.length > 0) {
+              for (const w of line.words) {
+                const txt = (w.text || '').trim();
+                if (txt.length > 0 && w.bbox) {
+                  rawWords.push({
+                    text: txt,
+                    confidence: Math.round(w.confidence || 0),
+                    bbox: w.bbox,
+                    lineIndex: lineCounter,
+                  });
                 }
               }
             }
           }
         }
 
-        // Fallback to blocks if lines wasn't populated
-        if (extractedTokens.length === 0 && ret.data.blocks) {
-          for (const block of ret.data.blocks) {
-            if (block.paragraphs) {
-              for (const p of block.paragraphs) {
-                if (p.lines) {
-                  for (const l of p.lines) {
-                    if (l.text && l.text.trim().length > 0) {
-                      extractedTokens.push({
-                        text: l.text.trim(),
-                        confidence: Math.round(l.confidence || 0),
-                        bbox: l.bbox,
-                        isLine: true,
-                      });
+        // Fallback to top-level words or nested blocks->paragraphs->lines->words if lines array was empty
+        if (rawWords.length === 0) {
+          const topWords = (ret.data as unknown as { words?: Array<{ text: string; confidence: number; bbox: { x0: number; y0: number; x1: number; y1: number } }> }).words;
+          if (topWords && topWords.length > 0) {
+            for (const w of topWords) {
+              const txt = (w.text || '').trim();
+              if (txt.length > 0 && w.bbox) {
+                rawWords.push({
+                  text: txt,
+                  confidence: Math.round(w.confidence || 0),
+                  bbox: w.bbox,
+                  lineIndex: 0,
+                });
+              }
+            }
+          } else if (ret.data.blocks) {
+            for (const block of ret.data.blocks) {
+              if (block.paragraphs) {
+                for (const p of block.paragraphs) {
+                  if (p.lines) {
+                    for (const l of p.lines) {
+                      lineCounter++;
                       if (l.words) {
                         for (const w of l.words) {
-                          if (w.text && w.text.trim().length > 0) {
-                            extractedTokens.push({
-                              text: w.text.trim(),
+                          const txt = (w.text || '').trim();
+                          if (txt.length > 0 && w.bbox) {
+                            rawWords.push({
+                              text: txt,
                               confidence: Math.round(w.confidence || 0),
                               bbox: w.bbox,
-                              isLine: false,
+                              lineIndex: lineCounter,
                             });
                           }
                         }
@@ -244,71 +285,140 @@ export function useOCRScanner(selectedLang: OcrLanguage) {
           }
         }
 
-        // Whole text check: if the entire parsed text contains a target, synthesize a box
-        for (const target of targetItems) {
-          const { isMatch } = checkMatch(rawFullText, target.text, mode);
-          if (isMatch && !extractedTokens.some((t) => checkMatch(t.text, target.text, mode).isMatch)) {
-            extractedTokens.push({
-              text: target.text,
-              confidence: 85,
-              bbox: {
-                x0: Math.round(targetW * 0.2),
-                y0: Math.round(targetH * 0.4),
-                x1: Math.round(targetW * 0.8),
-                y1: Math.round(targetH * 0.6),
-              },
-              isLine: true,
-            });
-          }
-        }
+        // Exact inverse scale back to native video source coordinates (srcW x srcH)
+        const invScaleX = 1 / scaleX;
+        const invScaleY = 1 / scaleY;
 
-        const invScale = 1 / scaleFactor;
         const allWords: MatchedWord[] = [];
         const matchedWords: MatchedWord[] = [];
         const itemToMatchesMap = new Map<string, MatchedWord[]>();
 
-        for (let i = 0; i < extractedTokens.length; i++) {
-          const t = extractedTokens[i];
-          const rawText = t.text;
-          const bbox = {
-            x0: Math.round(t.bbox.x0 * invScale),
-            y0: Math.round(t.bbox.y0 * invScale),
-            x1: Math.round(t.bbox.x1 * invScale),
-            y1: Math.round(t.bbox.y1 * invScale),
-          };
+        // 1. Evaluate every individual word token first
+        const matchedWordIndicesByTarget = new Map<string, Set<number>>();
 
-          let matchedItem: ChecklistItem | null = null;
+        for (let i = 0; i < rawWords.length; i++) {
+          const w = rawWords[i];
+          let bestItem: ChecklistItem | null = null;
           let highestScore = 0;
 
           for (const item of targetItems) {
-            const { isMatch, score } = checkMatch(rawText, item.text, mode);
+            // Only single-word match here if target doesn't require multiple words, or if single word contains it
+            const { isMatch, score } = checkMatch(w.text, item.text, mode);
             if (isMatch && score > highestScore) {
               highestScore = score;
-              matchedItem = item;
+              bestItem = item;
             }
           }
 
-          const isMatch = Boolean(matchedItem);
+          const tightCanvasBbox = bestItem
+            ? tightenWordBbox(w.bbox, w.text, bestItem.text)
+            : w.bbox;
+
+          const nativeBbox = {
+            x0: tightCanvasBbox.x0 * invScaleX,
+            y0: tightCanvasBbox.y0 * invScaleY,
+            x1: tightCanvasBbox.x1 * invScaleX,
+            y1: tightCanvasBbox.y1 * invScaleY,
+          };
+
+          const isMatch = Boolean(bestItem);
           const wordItem: MatchedWord = {
-            id: `tok-${i}-${Date.now()}`,
-            text: rawText,
-            normalizedText: rawText,
-            confidence: t.confidence,
-            bbox,
+            id: `word-${i}-${Date.now()}`,
+            text: w.text,
+            normalizedText: w.text,
+            confidence: w.confidence,
+            bbox: nativeBbox,
             isMatch,
             score: highestScore,
-            matchedItemId: matchedItem?.id,
-            matchedItemText: matchedItem?.text,
+            matchedItemId: bestItem?.id,
+            matchedItemText: bestItem?.text,
           };
 
           allWords.push(wordItem);
 
-          if (isMatch && matchedItem) {
+          if (isMatch && bestItem) {
             matchedWords.push(wordItem);
-            if (!itemToMatchesMap.has(matchedItem.id)) {
-              itemToMatchesMap.set(matchedItem.id, []);
+            if (!itemToMatchesMap.has(bestItem.id)) {
+              itemToMatchesMap.set(bestItem.id, []);
             }
-            itemToMatchesMap.get(matchedItem.id)!.push(wordItem);
+            itemToMatchesMap.get(bestItem.id)!.push(wordItem);
+
+            if (!matchedWordIndicesByTarget.has(bestItem.id)) {
+              matchedWordIndicesByTarget.set(bestItem.id, new Set());
+            }
+            matchedWordIndicesByTarget.get(bestItem.id)!.add(i);
+          }
+        }
+
+        // 2. Multi-word phrase support: check consecutive word slices (2 to 4 words on the same line)
+        // Computes tight union bbox of ONLY the consecutive matched words, never the whole line!
+        for (const item of targetItems) {
+          const targetWordsCount = item.text.trim().split(/\s+/).length;
+          // Also check 2-word slice in case OCR split a single target word into two adjacent tokens
+          const maxWindow = Math.min(4, Math.max(2, targetWordsCount + 1));
+
+          for (let i = 0; i < rawWords.length; i++) {
+            const alreadyMatchedIndices = matchedWordIndicesByTarget.get(item.id);
+            if (alreadyMatchedIndices && alreadyMatchedIndices.has(i)) continue;
+
+            for (let winLen = 2; winLen <= maxWindow && i + winLen <= rawWords.length; winLen++) {
+              const slice = rawWords.slice(i, i + winLen);
+              // Must be on the same line
+              if (slice.some((sw) => sw.lineIndex !== slice[0].lineIndex)) break;
+              // Skip if any word in slice already matched this item individually
+              if (alreadyMatchedIndices && slice.some((_, idx) => alreadyMatchedIndices.has(i + idx))) {
+                continue;
+              }
+
+              const joinedText = slice.map((s) => s.text).join(' ');
+              const { isMatch, score } = checkMatch(joinedText, item.text, mode);
+
+              // Ensure the match actually spans the slice (neither the first nor last word alone is the full match)
+              if (isMatch) {
+                const firstAlone = checkMatch(slice[0].text, item.text, mode).isMatch;
+                const lastAlone = checkMatch(slice[slice.length - 1].text, item.text, mode).isMatch;
+                if (!firstAlone && !lastAlone) {
+                  const unionX0 = Math.min(...slice.map((s) => s.bbox.x0)) * invScaleX;
+                  const unionY0 = Math.min(...slice.map((s) => s.bbox.y0)) * invScaleY;
+                  const unionX1 = Math.max(...slice.map((s) => s.bbox.x1)) * invScaleX;
+                  const unionY1 = Math.max(...slice.map((s) => s.bbox.y1)) * invScaleY;
+                  const avgConf = Math.round(
+                    slice.reduce((acc, s) => acc + s.confidence, 0) / slice.length
+                  );
+
+                  const phraseMatch: MatchedWord = {
+                    id: `phrase-${i}-${winLen}-${Date.now()}`,
+                    text: joinedText,
+                    normalizedText: joinedText,
+                    confidence: avgConf,
+                    bbox: {
+                      x0: unionX0,
+                      y0: unionY0,
+                      x1: unionX1,
+                      y1: unionY1,
+                    },
+                    isMatch: true,
+                    score,
+                    matchedItemId: item.id,
+                    matchedItemText: item.text,
+                  };
+
+                  matchedWords.push(phraseMatch);
+                  if (!itemToMatchesMap.has(item.id)) {
+                    itemToMatchesMap.set(item.id, []);
+                  }
+                  itemToMatchesMap.get(item.id)!.push(phraseMatch);
+
+                  if (!matchedWordIndicesByTarget.has(item.id)) {
+                    matchedWordIndicesByTarget.set(item.id, new Set());
+                  }
+                  for (let k = 0; k < winLen; k++) {
+                    matchedWordIndicesByTarget.get(item.id)!.add(i + k);
+                  }
+                  break;
+                }
+              }
+            }
           }
         }
 
@@ -316,8 +426,10 @@ export function useOCRScanner(selectedLang: OcrLanguage) {
         for (const target of targetItems) {
           const words = itemToMatchesMap.get(target.id);
           if (words && words.length > 0) {
-            const primaryWord = words.reduce((prev, curr) =>
-              (curr.confidence > prev.confidence ? curr : prev), words[0]);
+            const primaryWord = words.reduce(
+              (prev, curr) => (curr.confidence > prev.confidence ? curr : prev),
+              words[0]
+            );
             detectedGroups.push({
               item: target,
               words,
