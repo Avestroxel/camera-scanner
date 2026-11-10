@@ -1,0 +1,6 @@
+{
+  "name": "Live OCR Text Finder",
+  "description": "Real-time camera text scanner and highlighter PWA that finds target words in live video feeds with glowing bounding box overlays.",
+  "requestFramePermissions": ["camera"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
