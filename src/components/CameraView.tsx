@@ -95,11 +95,11 @@ export const CameraView: React.FC<Props> = ({
 
   const stickyTracksRef = useRef<StickyBoxTrack[]>([]);
   const detectedGroupsRef = useRef<DetectedMatchGroup[]>([]);
-  const scanDimsRef = useRef<{ w: number; h: number }>({ w: 580, h: 326 });
+  const scanDimsRef = useRef<{ w: number; h: number }>({ w: 1920, h: 1080 });
   const activeChecklistRef = useRef<ChecklistItem[]>(checklist);
   activeChecklistRef.current = checklist;
 
-  // Sync latest OCR matched bounding boxes into stickyTracksRef with anti-flicker grace window
+  // Sync latest OCR matched bounding boxes into stickyTracksRef with 450ms sticky memory window
   useEffect(() => {
     if (!lastScanResult) return;
 
@@ -114,6 +114,7 @@ export const CameraView: React.FC<Props> = ({
     const incomingWords = lastScanResult.matchedWords;
     const updatedTracks: StickyBoxTrack[] = [];
     const usedPrevIndices = new Set<number>();
+    const maxAssocDist = Math.max(180, lastScanResult.frameWidth * 0.14);
 
     for (let i = 0; i < incomingWords.length; i++) {
       const m = incomingWords[i];
@@ -121,7 +122,7 @@ export const CameraView: React.FC<Props> = ({
       const mCy = (m.bbox.y0 + m.bbox.y1) * 0.5;
 
       let bestPrevIdx = -1;
-      let bestDist = 130; // max distance in 580px OCR space to associate same word track
+      let bestDist = maxAssocDist;
 
       for (let j = 0; j < currentTracks.length; j++) {
         if (usedPrevIndices.has(j)) continue;
@@ -166,12 +167,12 @@ export const CameraView: React.FC<Props> = ({
       }
     }
 
-    // Keep recently seen tracks alive during brief single-frame motion blur (240ms hold window)
+    // Keep recently seen tracks alive across the 450ms sticky box memory window
     for (let j = 0; j < currentTracks.length; j++) {
       if (usedPrevIndices.has(j)) continue;
       const p = currentTracks[j];
       const stillInQueue = activeChecklistRef.current.some((item) => item.id === p.matchedItemId);
-      if (stillInQueue && now - p.lastSeenAt < 240) {
+      if (stillInQueue && now - p.lastSeenAt < 450) {
         updatedTracks.push(p);
       }
     }
@@ -209,7 +210,7 @@ export const CameraView: React.FC<Props> = ({
     };
   }, [stopTracks]);
 
-  // Initialize Camera Stream with 60fps shutter speed to eliminate motion blur while moving
+  // Initialize Full HD 1080p Camera Stream (1920x1080 @ 30fps) for crisp distant text
   const initCamera = useCallback(async () => {
     setCameraError(null);
     stopTracks();
@@ -219,10 +220,10 @@ export const CameraView: React.FC<Props> = ({
         audio: false,
         video: {
           facingMode: isFrontCamera ? 'user' : { ideal: 'environment' },
-          width: { ideal: 1280 },
-          height: { ideal: 720 },
-          frameRate: { ideal: 60, min: 30 },
-          // @ts-expect-error continuous focus and exposure modes reduce motion blur
+          width: { ideal: 1920 },
+          height: { ideal: 1080 },
+          frameRate: { ideal: 30 },
+          // @ts-expect-error continuous focus and exposure modes keep distant text sharp
           advanced: [{ focusMode: 'continuous' }, { exposureMode: 'continuous' }],
         },
       };
@@ -257,15 +258,15 @@ export const CameraView: React.FC<Props> = ({
         }
       }
     } catch (err) {
-      console.warn('Advanced camera constraints failed, trying basic:', err);
+      console.warn('Advanced camera constraints failed, trying basic Full HD:', err);
       try {
         const fallbackStream = await navigator.mediaDevices.getUserMedia({
           audio: false,
           video: {
             facingMode: isFrontCamera ? 'user' : { ideal: 'environment' },
-            width: { ideal: 1280 },
-            height: { ideal: 720 },
-            frameRate: { ideal: 60 },
+            width: { ideal: 1920 },
+            height: { ideal: 1080 },
+            frameRate: { ideal: 30 },
           },
         });
         streamRef.current = fallbackStream;
@@ -330,7 +331,7 @@ export const CameraView: React.FC<Props> = ({
     }
   };
 
-  // Manual scan trigger (called on viewfinder tap in manual mode or via button)
+  // Manual scan trigger (runs both Pass 0 Full-Frame HD and Pass 1 1:1 Native Crop on tap)
   const triggerManualScan = useCallback(async () => {
     const video = videoRef.current;
     const currentItems = activeChecklistRef.current;
@@ -338,13 +339,16 @@ export const CameraView: React.FC<Props> = ({
       if (video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA && video.videoWidth > 0) {
         setManualScanPulse(true);
         triggerHaptic(40);
-        await scanSource(video, currentItems, matchMode, true, true);
+        await Promise.all([
+          scanSource(video, currentItems, matchMode, true, true),
+          scanSource(video, currentItems, matchMode, false, false),
+        ]);
         setTimeout(() => setManualScanPulse(false), 500);
       }
     }
   }, [isInitializing, matchMode, scanSource]);
 
-  // Ultra-Fast Raw Frame OCR Loop (~50ms overlapping dual-worker dispatch -> ~100ms effective cycle)
+  // Dual-Pass High-Resolution 1:1 Pixel OCR Loop (~60ms dispatch alternating Full-Frame & 1:1 Center Crop)
   useEffect(() => {
     if (scanMode !== 'auto' || isInitializing) return;
 
@@ -357,14 +361,14 @@ export const CameraView: React.FC<Props> = ({
           void scanSource(video, currentItems, matchMode, true, true);
         }
       }
-    }, 50);
+    }, 60);
 
     return () => {
       clearInterval(intervalId);
     };
   }, [isInitializing, scanSource, matchMode, scanMode]);
 
-  // Sticky 60fps Green Pill Box Renderer (Velocity-Assisted Coordinate Interpolation)
+  // Sticky 60fps Green Pill Box Renderer (450ms Sticky Box Memory + Velocity-Assisted Interpolation)
   useEffect(() => {
     let animId: number;
 
@@ -402,9 +406,9 @@ export const CameraView: React.FC<Props> = ({
             const offsetY = (screenH - srcH * scale) / 2;
 
             const now = performance.now();
-            // Prune expired tracks (> 280ms without OCR confirmation)
+            // Prune expired tracks (> 450ms sticky box memory window)
             const activeTracks = stickyTracksRef.current.filter(
-              (tr) => now - tr.lastSeenAt < 280
+              (tr) => now - tr.lastSeenAt < 450
             );
             stickyTracksRef.current = activeTracks;
 
@@ -463,9 +467,9 @@ export const CameraView: React.FC<Props> = ({
               const rh = tr.h + padY * 2;
               const pillRadius = Math.min(8, Math.max(4, rh * 0.32));
 
-              // Smooth fade-out if track is at the end of its hold window
+              // Smooth fade-out only at the end of the 450ms sticky box memory window (360ms -> 450ms)
               const ageMs = now - tr.lastSeenAt;
-              const fadeAlpha = ageMs > 180 ? Math.max(0, 1 - (ageMs - 180) / 100) : 1;
+              const fadeAlpha = ageMs > 360 ? Math.max(0, 1 - (ageMs - 360) / 90) : 1;
 
               ctx.save();
               ctx.globalAlpha = fadeAlpha;

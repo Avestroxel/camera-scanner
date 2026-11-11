@@ -17,9 +17,22 @@ interface RawLineItem {
   words: RawWordItem[];
 }
 
+interface StickyRecentMatch {
+  word: MatchedWord;
+  item: ChecklistItem;
+  timestamp: number;
+}
+
 const FAST_LANG_CDN = 'https://tessdata.projectnaptha.com/4.0.0_fast';
 const PARALLEL_WORKERS = 2;
-const OCR_TARGET_WIDTH = 580;
+
+// Pass 0: High-resolution full-frame overview width (2.2x sharper than 580px)
+const FULL_PASS_MAX_WIDTH = 1280;
+// Pass 1: 1:1 Native sensor pixel crop dimensions (ZERO downscaling for distant/small text)
+const NATIVE_CROP_MAX_W = 960;
+const NATIVE_CROP_MAX_H = 680;
+// 450ms sticky box memory window across dual passes
+const STICKY_MEMORY_MS = 450;
 
 /**
  * Foolproof cleaner for English, Kurdish, and Arabic text/numbers
@@ -67,7 +80,7 @@ function tightenWordBbox(
 export function useOCRScanner(selectedLang: OcrLanguage) {
   const [isInitializing, setIsInitializing] = useState(true);
   const [initProgress, setInitProgress] = useState(0);
-  const [initStatusText, setInitStatusText] = useState('Loading Fast OCR Engine...');
+  const [initStatusText, setInitStatusText] = useState('Loading Fast HD OCR Engine...');
   const [workerStatus, setWorkerStatus] = useState<'initializing' | 'ready' | 'error'>('initializing');
   const [rawTextPreview, setRawTextPreview] = useState<string>('');
   const [isProcessing, setIsProcessing] = useState(false);
@@ -76,13 +89,13 @@ export function useOCRScanner(selectedLang: OcrLanguage) {
 
   const schedulerRef = useRef<Scheduler | null>(null);
   const workersRef = useRef<Worker[]>([]);
-  // Dual 580px offscreen canvas pool so 2 parallel workers never overwrite each other's frame
+  // Dual offscreen canvas pool (Slot 0: Full-Frame HD Pass, Slot 1: 1:1 Native Pixel Distant Pass)
   const canvasPoolRef = useRef<[HTMLCanvasElement | null, HTMLCanvasElement | null]>([null, null]);
-  const poolIndexRef = useRef<number>(0);
+  const passToggleRef = useRef<number>(0);
   const activeJobsRef = useRef<number>(0);
-  const latestCompletedSeqRef = useRef<number>(0);
-  const jobSeqCounterRef = useRef<number>(0);
   const previousMatchedItemIdsRef = useRef<Set<string>>(new Set());
+  // 450ms sticky match memory so Pass 0 (Full Frame) and Pass 1 (1:1 Center Crop) fuse seamlessly
+  const recentMatchesRef = useRef<StickyRecentMatch[]>([]);
 
   // Initialize Dual-Worker Tesseract v5 Scheduler with 4.0.0_fast + PSM 11 + DAWG disabled
   useEffect(() => {
@@ -92,7 +105,7 @@ export function useOCRScanner(selectedLang: OcrLanguage) {
       setIsInitializing(true);
       setWorkerStatus('initializing');
       setInitProgress(15);
-      setInitStatusText(`Loading Fast ${selectedLang}...`);
+      setInitStatusText(`Loading Fast HD ${selectedLang}...`);
 
       if (schedulerRef.current) {
         try {
@@ -121,7 +134,7 @@ export function useOCRScanner(selectedLang: OcrLanguage) {
                           setInitStatusText('Loading Fast Core...');
                         } else if (m.status === 'initializing tesseract') {
                           setInitProgress(60);
-                          setInitStatusText('Initializing Dual Workers...');
+                          setInitStatusText('Initializing Dual HD Workers...');
                         } else if (m.status.includes('loading') || m.status.includes('traineddata')) {
                           const p = Math.round((m.progress || 0) * 35) + 60;
                           setInitProgress(Math.min(98, p));
@@ -137,9 +150,10 @@ export function useOCRScanner(selectedLang: OcrLanguage) {
             worker = await createWorker(selectedLang, 1);
           }
 
-          // PSM 11 (Sparse text - ultra fast) + disable dictionary DAWGs & unused serialization
+          // PSM 11 (Sparse text - ultra fast) + 300 DPI hint for small distant text + disable DAWGs
           await worker.setParameters({
             tessedit_pageseg_mode: PSM.SPARSE_TEXT,
+            user_defined_dpi: '300',
             load_system_dawg: '0',
             load_freq_dawg: '0',
             tessjs_create_hocr: '0',
@@ -171,7 +185,7 @@ export function useOCRScanner(selectedLang: OcrLanguage) {
         setIsInitializing(false);
         setWorkerStatus('ready');
         setInitProgress(100);
-        setInitStatusText('Ready / Scanning...');
+        setInitStatusText('Ready / HD 1:1 Scanning...');
         setError(null);
       } catch (err) {
         if (!isCancelled) {
@@ -197,7 +211,13 @@ export function useOCRScanner(selectedLang: OcrLanguage) {
     };
   }, [selectedLang]);
 
-  // Ultra-fast raw 580px frame OCR scan (~100ms cycle)
+  /**
+   * Dual-Pass High-Resolution 1:1 Pixel Pipeline:
+   * - Pass 0 (Full-Frame HD): Captures the entire frame up to 1280px wide to catch text anywhere on screen.
+   * - Pass 1 (1:1 Native Pixel Center Crop): Captures the central region at true 1:1 sensor resolution
+   *   with ZERO downscaling so small or distant text is read cleanly without zooming in.
+   * All bounding boxes are transformed back into unified native video coordinates (videoW x videoH).
+   */
   const scanSource = useCallback(
     async (
       source: HTMLVideoElement | HTMLCanvasElement | HTMLImageElement,
@@ -240,48 +260,84 @@ export function useOCRScanner(selectedLang: OcrLanguage) {
 
       activeJobsRef.current += 1;
       setIsProcessing(true);
-      const currentSeq = ++jobSeqCounterRef.current;
       const startTime = performance.now();
 
       try {
-        // Fixed compact width of 580px (height scaled proportionally to videoHeight / videoWidth)
-        const ocrW = OCR_TARGET_WIDTH;
-        const ocrH = Math.max(1, Math.round((videoH / videoW) * ocrW));
+        // Alternate between Pass 0 (Full-Frame High-Res) and Pass 1 (1:1 Native Pixel Center Crop)
+        const passType = passToggleRef.current % 2;
+        passToggleRef.current = (passToggleRef.current + 1) % 2;
 
-        const slot = poolIndexRef.current % 2;
-        poolIndexRef.current = (poolIndexRef.current + 1) % 2;
-
-        if (!canvasPoolRef.current[slot]) {
-          canvasPoolRef.current[slot] = document.createElement('canvas');
+        if (!canvasPoolRef.current[passType]) {
+          canvasPoolRef.current[passType] = document.createElement('canvas');
         }
-        const ocrCanvas = canvasPoolRef.current[slot]!;
-        if (ocrCanvas.width !== ocrW || ocrCanvas.height !== ocrH) {
-          ocrCanvas.width = ocrW;
-          ocrCanvas.height = ocrH;
-        }
+        const ocrCanvas = canvasPoolRef.current[passType]!;
 
-        const ocrCtx = ocrCanvas.getContext('2d', { alpha: false });
-        if (!ocrCtx) {
-          return null;
-        }
+        // Coordinate mapping parameters from ocrCanvas -> native video (videoW x videoH)
+        let cropOffsetX = 0;
+        let cropOffsetY = 0;
+        let scaleToVideoX = 1;
+        let scaleToVideoY = 1;
 
-        // Draw raw <video> frame directly — ZERO CSS/SVG/pixel filters
-        ocrCtx.drawImage(source, 0, 0, ocrW, ocrH);
+        if (passType === 1 && (videoW > NATIVE_CROP_MAX_W || videoH > NATIVE_CROP_MAX_H)) {
+          // PASS 1: 1:1 Native Sensor Pixel Center Crop (ZERO downscaling for distant small text)
+          const cropW = Math.min(videoW, NATIVE_CROP_MAX_W);
+          const cropH = Math.min(videoH, NATIVE_CROP_MAX_H);
+          cropOffsetX = Math.round((videoW - cropW) * 0.5);
+          cropOffsetY = Math.round((videoH - cropH) * 0.5);
+
+          if (ocrCanvas.width !== cropW || ocrCanvas.height !== cropH) {
+            ocrCanvas.width = cropW;
+            ocrCanvas.height = cropH;
+          }
+
+          const ocrCtx = ocrCanvas.getContext('2d', { alpha: false });
+          if (!ocrCtx) return null;
+
+          ocrCtx.imageSmoothingEnabled = false;
+          ocrCtx.drawImage(source, cropOffsetX, cropOffsetY, cropW, cropH, 0, 0, cropW, cropH);
+          scaleToVideoX = 1;
+          scaleToVideoY = 1;
+        } else {
+          // PASS 0: High-Resolution Full-Frame Pass (up to 1280px wide)
+          const ocrW = Math.min(videoW, FULL_PASS_MAX_WIDTH);
+          const ocrH = Math.max(1, Math.round((videoH / videoW) * ocrW));
+
+          if (ocrCanvas.width !== ocrW || ocrCanvas.height !== ocrH) {
+            ocrCanvas.width = ocrW;
+            ocrCanvas.height = ocrH;
+          }
+
+          const ocrCtx = ocrCanvas.getContext('2d', { alpha: false });
+          if (!ocrCtx) return null;
+
+          ocrCtx.imageSmoothingEnabled = true;
+          ocrCtx.imageSmoothingQuality = 'high';
+          ocrCtx.drawImage(source, 0, 0, ocrW, ocrH);
+
+          cropOffsetX = 0;
+          cropOffsetY = 0;
+          scaleToVideoX = videoW / ocrW;
+          scaleToVideoY = videoH / ocrH;
+        }
 
         const ret = await schedulerRef.current.addJob('recognize', ocrCanvas);
-
-        if (currentSeq < latestCompletedSeqRef.current) {
-          return null;
-        }
-        latestCompletedSeqRef.current = currentSeq;
-
         const data = ret.data;
         const rawFullText = (data.text || '').trim();
 
-        const sanitizedPreview = rawFullText.replace(/\s+/g, ' ').slice(0, 60);
-        setRawTextPreview(sanitizedPreview);
+        if (rawFullText) {
+          const sanitizedPreview = rawFullText.replace(/\s+/g, ' ').slice(0, 60);
+          setRawTextPreview(sanitizedPreview);
+        }
 
-        // Extract words and lines
+        // Helper to map ocrCanvas bbox -> native videoW x videoH coordinate space
+        const toVideoBbox = (b: { x0: number; y0: number; x1: number; y1: number }) => ({
+          x0: b.x0 * scaleToVideoX + cropOffsetX,
+          y0: b.y0 * scaleToVideoY + cropOffsetY,
+          x1: b.x1 * scaleToVideoX + cropOffsetX,
+          y1: b.y1 * scaleToVideoY + cropOffsetY,
+        });
+
+        // Extract words and lines mapped to native videoW x videoH coordinates
         const wordsList: RawWordItem[] = [];
         const linesList: RawLineItem[] = [];
 
@@ -292,7 +348,7 @@ export function useOCRScanner(selectedLang: OcrLanguage) {
               wordsList.push({
                 text: w.text.trim(),
                 confidence: Math.round(w.confidence || 85),
-                bbox: w.bbox,
+                bbox: toVideoBbox(w.bbox),
               });
             }
           }
@@ -307,7 +363,7 @@ export function useOCRScanner(selectedLang: OcrLanguage) {
                   const item: RawWordItem = {
                     text: w.text.trim(),
                     confidence: Math.round(w.confidence || 85),
-                    bbox: w.bbox,
+                    bbox: toVideoBbox(w.bbox),
                   };
                   lineWords.push(item);
                   if (wordsList.length === 0) {
@@ -320,7 +376,7 @@ export function useOCRScanner(selectedLang: OcrLanguage) {
               linesList.push({
                 text: line.text.trim(),
                 confidence: Math.round(line.confidence || 85),
-                bbox: line.bbox,
+                bbox: toVideoBbox(line.bbox),
                 words: lineWords,
               });
             }
@@ -340,7 +396,7 @@ export function useOCRScanner(selectedLang: OcrLanguage) {
                           const item: RawWordItem = {
                             text: w.text.trim(),
                             confidence: Math.round(w.confidence || 85),
-                            bbox: w.bbox,
+                            bbox: toVideoBbox(w.bbox),
                           };
                           lineWords.push(item);
                           wordsList.push(item);
@@ -351,7 +407,7 @@ export function useOCRScanner(selectedLang: OcrLanguage) {
                       linesList.push({
                         text: l.text.trim(),
                         confidence: Math.round(l.confidence || 85),
-                        bbox: l.bbox,
+                        bbox: toVideoBbox(l.bbox),
                         words: lineWords,
                       });
                     }
@@ -362,8 +418,7 @@ export function useOCRScanner(selectedLang: OcrLanguage) {
           }
         }
 
-        const matchedWords: MatchedWord[] = [];
-        const itemToMatchesMap = new Map<string, MatchedWord[]>();
+        const currentPassWords: MatchedWord[] = [];
 
         for (const targetItem of targetItems) {
           const cleanTarget = clean(targetItem.text);
@@ -387,7 +442,7 @@ export function useOCRScanner(selectedLang: OcrLanguage) {
               matchedInWords = true;
               const tightBbox = tightenWordBbox(w.bbox, w.text, targetItem.text);
               const matchObj: MatchedWord = {
-                id: `w-${targetItem.id}-${i}`,
+                id: `w-${targetItem.id}-${passType}-${i}`,
                 text: w.text,
                 normalizedText: cleanWord,
                 confidence: w.confidence,
@@ -398,11 +453,7 @@ export function useOCRScanner(selectedLang: OcrLanguage) {
                 matchedItemText: targetItem.text,
               };
 
-              matchedWords.push(matchObj);
-              if (!itemToMatchesMap.has(targetItem.id)) {
-                itemToMatchesMap.set(targetItem.id, []);
-              }
-              itemToMatchesMap.get(targetItem.id)!.push(matchObj);
+              currentPassWords.push(matchObj);
             }
           }
 
@@ -440,7 +491,7 @@ export function useOCRScanner(selectedLang: OcrLanguage) {
                   : line.bbox;
 
               const matchObj: MatchedWord = {
-                id: `l-${targetItem.id}-${lIdx}`,
+                id: `l-${targetItem.id}-${passType}-${lIdx}`,
                 text: line.text,
                 normalizedText: cleanLine,
                 confidence: line.confidence,
@@ -451,13 +502,54 @@ export function useOCRScanner(selectedLang: OcrLanguage) {
                 matchedItemText: targetItem.text,
               };
 
-              matchedWords.push(matchObj);
-              if (!itemToMatchesMap.has(targetItem.id)) {
-                itemToMatchesMap.set(targetItem.id, []);
-              }
-              itemToMatchesMap.get(targetItem.id)!.push(matchObj);
+              currentPassWords.push(matchObj);
             }
           }
+        }
+
+        // Fuse current pass detections with 450ms sticky match memory across Pass 0 and Pass 1
+        const now = performance.now();
+        const activeTargetIds = new Set(targetItems.map((t) => t.id));
+        const survivingMemory = recentMatchesRef.current.filter(
+          (entry) =>
+            now - entry.timestamp < STICKY_MEMORY_MS &&
+            activeTargetIds.has(entry.item.id)
+        );
+
+        const targetById = new Map(targetItems.map((t) => [t.id, t]));
+        const dedupRadius = Math.max(90, videoW * 0.06);
+
+        for (const w of currentPassWords) {
+          const item = w.matchedItemId ? targetById.get(w.matchedItemId) : undefined;
+          if (!item) continue;
+
+          const wCx = (w.bbox.x0 + w.bbox.x1) * 0.5;
+          const wCy = (w.bbox.y0 + w.bbox.y1) * 0.5;
+
+          // Replace existing memory entry if it represents the same physical word on screen
+          const existingIdx = survivingMemory.findIndex((m) => {
+            if (m.item.id !== item.id) return false;
+            const mCx = (m.word.bbox.x0 + m.word.bbox.x1) * 0.5;
+            const mCy = (m.word.bbox.y0 + m.word.bbox.y1) * 0.5;
+            return Math.hypot(wCx - mCx, wCy - mCy) < dedupRadius;
+          });
+
+          if (existingIdx >= 0) {
+            survivingMemory[existingIdx] = { word: w, item, timestamp: now };
+          } else {
+            survivingMemory.push({ word: w, item, timestamp: now });
+          }
+        }
+
+        recentMatchesRef.current = survivingMemory;
+
+        const fusedMatchedWords = survivingMemory.map((m) => m.word);
+        const itemToMatchesMap = new Map<string, MatchedWord[]>();
+        for (const m of survivingMemory) {
+          if (!itemToMatchesMap.has(m.item.id)) {
+            itemToMatchesMap.set(m.item.id, []);
+          }
+          itemToMatchesMap.get(m.item.id)!.push(m.word);
         }
 
         const detectedGroups: DetectedMatchGroup[] = [];
@@ -478,13 +570,14 @@ export function useOCRScanner(selectedLang: OcrLanguage) {
 
         const endTime = performance.now();
         const result: ScanResult = {
-          allWords: matchedWords,
-          matchedWords,
+          allWords: fusedMatchedWords,
+          matchedWords: fusedMatchedWords,
           detectedGroups,
           fullText: rawFullText,
           processingTimeMs: Math.round(endTime - startTime),
-          frameWidth: ocrW,
-          frameHeight: ocrH,
+          // Always report native videoW x videoH so screen overlay mapping is 100% unified
+          frameWidth: videoW,
+          frameHeight: videoH,
         };
 
         setLastScanResult(result);
