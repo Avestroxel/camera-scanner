@@ -11,7 +11,7 @@ import {
 } from 'lucide-react';
 import { OcrLanguage, MatchMode, ChecklistItem, DetectedMatchGroup } from '../types';
 import { Translation } from '../translations';
-import { useOCRScanner, OCR_MATRIX_WIDTH } from '../hooks/useOCRScanner';
+import { useOCRScanner } from '../hooks/useOCRScanner';
 import { CelebrationOverlay } from './CelebrationOverlay';
 import { triggerHaptic } from '../utils/audioAlert';
 
@@ -30,9 +30,9 @@ interface Props {
 }
 
 interface TrackedSpatialBox {
-  spatialId: string;
+  key: string;
   targetId: string;
-  // Coordinates in 1152px ocrCanvas matrix space
+  // Intrinsic video coordinates (videoW x videoH)
   bbox: { x0: number; y0: number; x1: number; y1: number };
   // Rendered screen-space coordinates
   renderX: number;
@@ -40,12 +40,10 @@ interface TrackedSpatialBox {
   renderW: number;
   renderH: number;
   lastSeenTimestamp: number;
-  missedFrames: number;
   initialized: boolean;
 }
 
-const LOCK_ON_TTL_MS = 2500;
-const MAX_MISSED_SCANS = 4;
+const HOLD_TTL_MS = 400;
 
 export const CameraView: React.FC<Props> = ({
   checklist,
@@ -72,7 +70,7 @@ export const CameraView: React.FC<Props> = ({
   const [showQueueDropdown, setShowQueueDropdown] = useState(false);
   const [successToast, setSuccessToast] = useState<string | null>(null);
 
-  // Zoom control state (Hardware or Digital fallback)
+  // Zoom control state (Hardware optical zoom or synchronized CSS digital zoom fallback)
   const [zoomLevel, setZoomLevel] = useState<number>(1);
   const [hardwareZoomAvailable, setHardwareZoomAvailable] = useState(false);
   const [zoomMinMax, setZoomMinMax] = useState<{ min: number; max: number }>({ min: 1, max: 3 });
@@ -81,7 +79,7 @@ export const CameraView: React.FC<Props> = ({
   const [scanMode, setScanMode] = useState<'auto' | 'manual'>('auto');
   const [manualScanPulse, setManualScanPulse] = useState(false);
 
-  // Full-Screen 1152px Matrix OCR Hook
+  // 1:1 Native Center-Strip OCR Hook
   const {
     isInitializing,
     lastScanResult,
@@ -92,7 +90,7 @@ export const CameraView: React.FC<Props> = ({
 
   const trackedBoxesRef = useRef<TrackedSpatialBox[]>([]);
   const detectedGroupsRef = useRef<DetectedMatchGroup[]>([]);
-  const scanDimsRef = useRef<{ w: number; h: number }>({ w: OCR_MATRIX_WIDTH, h: 648 });
+  const scanDimsRef = useRef<{ w: number; h: number }>({ w: 1920, h: 1080 });
   const activeChecklistRef = useRef<ChecklistItem[]>(checklist);
   activeChecklistRef.current = checklist;
   const completedIdsRef = useRef<Set<string>>(new Set());
@@ -110,7 +108,7 @@ export const CameraView: React.FC<Props> = ({
     );
   }, [checklist]);
 
-  // PHASE 4: Multi-Occurrence Spatial Tracking (tracks every occurrence independently)
+  // Sync latest OCR matched bounding boxes into trackedBoxesRef (1-to-1 replacement prevents x3 ghost splitting!)
   useEffect(() => {
     if (!lastScanResult) return;
 
@@ -125,17 +123,9 @@ export const CameraView: React.FC<Props> = ({
       activeIds.has(g.item.id)
     );
 
-    const ocrW = lastScanResult.frameWidth || OCR_MATRIX_WIDTH;
-    const ocrH = lastScanResult.frameHeight || 648;
-    scanDimsRef.current = { w: ocrW, h: ocrH };
-
-    const videoEl = videoRef.current;
-    const rect = videoEl?.getBoundingClientRect();
-    const viewW = rect?.width || window.innerWidth;
-    const viewH = rect?.height || window.innerHeight;
-    const scale = Math.max(viewW / ocrW, viewH / ocrH);
-    const offsetX = (viewW - ocrW * scale) * 0.5;
-    const offsetY = (viewH - ocrH * scale) * 0.5;
+    const videoW = lastScanResult.frameWidth || 1920;
+    const videoH = lastScanResult.frameHeight || 1080;
+    scanDimsRef.current = { w: videoW, h: videoH };
 
     const currentTracks = trackedBoxesRef.current.filter(
       (t) => activeIds.has(t.targetId) && !completedIdsRef.current.has(t.targetId)
@@ -151,17 +141,12 @@ export const CameraView: React.FC<Props> = ({
       const m = incomingWords[i];
       const targetId = m.matchedItemId!;
 
-      // Screen-space coordinates for spatial instance ID
-      const boxX = m.bbox.x0 * scale + offsetX;
-      const boxY = m.bbox.y0 * scale + offsetY;
-      const spatialId = `${targetId}_${Math.round(boxX / 60)}_${Math.round(boxY / 60)}`;
-
       const mCx = (m.bbox.x0 + m.bbox.x1) * 0.5;
       const mCy = (m.bbox.y0 + m.bbox.y1) * 0.5;
 
-      // Associate with nearest existing spatial instance of the same target item (< 100px in OCR space)
+      // Associate with nearest existing box of the same target item (< 80px in video coordinates)
       let bestPrevIdx = -1;
-      let bestDist = 100;
+      let bestDist = 80;
 
       for (let j = 0; j < currentTracks.length; j++) {
         if (matchedPrevIndices.has(j)) continue;
@@ -182,14 +167,12 @@ export const CameraView: React.FC<Props> = ({
         const prev = currentTracks[bestPrevIdx];
         updatedTracks.push({
           ...prev,
-          spatialId,
           bbox: m.bbox,
           lastSeenTimestamp: now,
-          missedFrames: 0,
         });
       } else {
         updatedTracks.push({
-          spatialId,
+          key: `${targetId}_${i}_${now}`,
           targetId,
           bbox: m.bbox,
           renderX: 0,
@@ -197,26 +180,7 @@ export const CameraView: React.FC<Props> = ({
           renderW: 0,
           renderH: 0,
           lastSeenTimestamp: now,
-          missedFrames: 0,
           initialized: false,
-        });
-      }
-    }
-
-    // Keep detected boxes locked on for up to 2500ms (or 4 missed scans)
-    for (let j = 0; j < currentTracks.length; j++) {
-      if (matchedPrevIndices.has(j)) continue;
-      const p = currentTracks[j];
-      const nextMissed = p.missedFrames + 1;
-      if (
-        activeIds.has(p.targetId) &&
-        !completedIdsRef.current.has(p.targetId) &&
-        now - p.lastSeenTimestamp < LOCK_ON_TTL_MS &&
-        nextMissed <= MAX_MISSED_SCANS
-      ) {
-        updatedTracks.push({
-          ...p,
-          missedFrames: nextMissed,
         });
       }
     }
@@ -254,7 +218,7 @@ export const CameraView: React.FC<Props> = ({
     };
   }, [stopTracks]);
 
-  // Initialize Full HD 1080p Camera Stream (1920x1080 @ 30fps)
+  // Initialize Full HD 1080p Camera Stream (1920x1080 @ 30fps, continuous focus)
   const initCamera = useCallback(async () => {
     setCameraError(null);
     stopTracks();
@@ -267,7 +231,7 @@ export const CameraView: React.FC<Props> = ({
           width: { ideal: 1920 },
           height: { ideal: 1080 },
           frameRate: { ideal: 30 },
-          // @ts-expect-error continuous focus and exposure modes keep text sharp
+          // @ts-expect-error continuous focus and exposure modes keep small receipt text sharp
           advanced: [{ focusMode: 'continuous' }, { exposureMode: 'continuous' }],
         },
       };
@@ -357,7 +321,7 @@ export const CameraView: React.FC<Props> = ({
     trackedBoxesRef.current = [];
   };
 
-  // Apply Hardware / Digital Zoom (1x, 2x, 3x)
+  // Apply Hardware Optical Zoom (or synchronized CSS parent zoom fallback)
   const applyZoom = async (level: number) => {
     setZoomLevel(level);
     trackedBoxesRef.current = [];
@@ -392,7 +356,7 @@ export const CameraView: React.FC<Props> = ({
     }
   }, [isInitializing, matchMode, scanSource]);
 
-  // Adaptive Zero-Delay Async OCR Loop (`while (active) { await scanOnce(); }`)
+  // Adaptive Zero-Delay Async OCR Loop
   useEffect(() => {
     if (scanMode !== 'auto' || isInitializing) return;
 
@@ -412,8 +376,7 @@ export const CameraView: React.FC<Props> = ({
           video.videoWidth > 0
         ) {
           await scanSource(video, currentItems, matchMode, true, true);
-          // Brief 16ms frame yield so the 60fps UI thread stays silky smooth
-          await new Promise((r) => setTimeout(r, 16));
+          await new Promise((r) => setTimeout(r, 12));
         } else {
           await new Promise((r) => setTimeout(r, 50));
         }
@@ -427,19 +390,19 @@ export const CameraView: React.FC<Props> = ({
     };
   }, [isInitializing, scanSource, matchMode, scanMode]);
 
-  // PHASE 3: Zero-Offset Pixel-Locked Coordinate Mapping & Instant Snap Renderer
+  // Exact Intrinsic-Video-to-Screen Coordinate Mapper & Instant-Snap 60fps Renderer
   useEffect(() => {
     let animId: number;
 
     const render = () => {
       const canvas = canvasRef.current;
+      const container = containerRef.current;
       const videoEl = videoRef.current;
 
-      if (canvas && videoEl) {
-        // 1. Sync <canvas> dimensions & position to exact <video> client rect
-        const rect = videoEl.getBoundingClientRect();
-        const viewW = rect.width;
-        const viewH = rect.height;
+      if (canvas && container && videoEl) {
+        // Read untransformed viewport dimensions from container so CSS scale(zoomLevel) on shared wrapper never double-scales!
+        const viewW = container.clientWidth || window.innerWidth;
+        const viewH = container.clientHeight || window.innerHeight;
         const dpr = window.devicePixelRatio || 1;
 
         const targetW = Math.round(viewW * dpr);
@@ -455,14 +418,14 @@ export const CameraView: React.FC<Props> = ({
           ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
           ctx.clearRect(0, 0, viewW, viewH);
 
-          const ocrW = scanDimsRef.current.w;
-          const ocrH = scanDimsRef.current.h;
+          const videoW = videoEl.videoWidth || scanDimsRef.current.w;
+          const videoH = videoEl.videoHeight || scanDimsRef.current.h;
 
-          if (ocrW > 0 && ocrH > 0 && viewW > 0 && viewH > 0) {
-            // 2. Exact object-fit: cover transformation
-            const scale = Math.max(viewW / ocrW, viewH / ocrH);
-            const offsetX = (viewW - ocrW * scale) / 2;
-            const offsetY = (viewH - ocrH * scale) / 2;
+          if (videoW > 0 && videoH > 0 && viewW > 0 && viewH > 0) {
+            // Map full intrinsic video coordinates (videoW, videoH) to object-fit: cover screen rect (viewW, viewH)
+            const scale = Math.max(viewW / videoW, viewH / videoH);
+            const offsetX = (viewW - videoW * scale) / 2;
+            const offsetY = (viewH - videoH * scale) / 2;
 
             const now = performance.now();
             const liveActiveIds = new Set(
@@ -471,11 +434,10 @@ export const CameraView: React.FC<Props> = ({
                 .map((i) => i.id)
             );
 
-            // Prune expired tracks (> 2500ms or > 4 missed scans) and completed items
+            // Prune stale tracks (> 400ms) and completed items immediately
             const activeTracks = trackedBoxesRef.current.filter(
               (tr) =>
-                now - tr.lastSeenTimestamp < LOCK_ON_TTL_MS &&
-                tr.missedFrames <= MAX_MISSED_SCANS &&
+                now - tr.lastSeenTimestamp < HOLD_TTL_MS &&
                 liveActiveIds.has(tr.targetId) &&
                 !completedIdsRef.current.has(tr.targetId)
             );
@@ -483,59 +445,59 @@ export const CameraView: React.FC<Props> = ({
 
             for (let i = 0; i < activeTracks.length; i++) {
               const tr = activeTracks[i];
-              let boxX = tr.bbox.x0 * scale + offsetX;
-              const boxY = tr.bbox.y0 * scale + offsetY;
-              const boxW = (tr.bbox.x1 - tr.bbox.x0) * scale;
-              const boxH = (tr.bbox.y1 - tr.bbox.y0) * scale;
+              let screenX = tr.bbox.x0 * scale + offsetX;
+              const screenY = tr.bbox.y0 * scale + offsetY;
+              const screenW = (tr.bbox.x1 - tr.bbox.x0) * scale;
+              const screenH = (tr.bbox.y1 - tr.bbox.y0) * scale;
 
               if (isFrontCamera) {
-                boxX = viewW - (boxX + boxW);
+                screenX = viewW - (screenX + screenW);
               }
 
-              // 3. Instant Snap on First Detection (or large >100px jump); lerp=0.55 for <100px motion
+              // Instant snap on first detection or >45px row jump; smooth lerp=0.65 for micro jitter
               if (!tr.initialized) {
-                tr.renderX = boxX;
-                tr.renderY = boxY;
-                tr.renderW = boxW;
-                tr.renderH = boxH;
+                tr.renderX = screenX;
+                tr.renderY = screenY;
+                tr.renderW = screenW;
+                tr.renderH = screenH;
                 tr.initialized = true;
               } else {
-                const moveDist = Math.hypot(boxX - tr.renderX, boxY - tr.renderY);
-                if (moveDist >= 100) {
-                  tr.renderX = boxX;
-                  tr.renderY = boxY;
-                  tr.renderW = boxW;
-                  tr.renderH = boxH;
+                const moveDist = Math.hypot(screenX - tr.renderX, screenY - tr.renderY);
+                if (moveDist >= 45) {
+                  tr.renderX = screenX;
+                  tr.renderY = screenY;
+                  tr.renderW = screenW;
+                  tr.renderH = screenH;
                 } else {
-                  const lerp = 0.55;
-                  tr.renderX += (boxX - tr.renderX) * lerp;
-                  tr.renderY += (boxY - tr.renderY) * lerp;
-                  tr.renderW += (boxW - tr.renderW) * lerp;
-                  tr.renderH += (boxH - tr.renderH) * lerp;
+                  const lerp = 0.65;
+                  tr.renderX += (screenX - tr.renderX) * lerp;
+                  tr.renderY += (screenY - tr.renderY) * lerp;
+                  tr.renderW += (screenW - tr.renderW) * lerp;
+                  tr.renderH += (screenH - tr.renderH) * lerp;
                 }
               }
 
-              // Clean green pill box geometry (zero text labels inside/above box)
-              const padX = 4;
-              const padY = 2;
+              // Clean green pill box geometry
+              const padX = 3;
+              const padY = 1.5;
               const rx = tr.renderX - padX;
               const ry = tr.renderY - padY;
               const rw = tr.renderW + padX * 2;
               const rh = tr.renderH + padY * 2;
-              const pillRadius = Math.min(8, Math.max(4, rh * 0.32));
+              const pillRadius = Math.min(6, Math.max(3, rh * 0.3));
 
               ctx.save();
               ctx.globalAlpha = 1;
               ctx.shadowColor = '#22c55e';
-              ctx.shadowBlur = 8;
+              ctx.shadowBlur = 6;
 
-              ctx.fillStyle = 'rgba(34, 197, 94, 0.24)';
+              ctx.fillStyle = 'rgba(34, 197, 94, 0.25)';
               ctx.beginPath();
               ctx.roundRect(rx, ry, rw, rh, pillRadius);
               ctx.fill();
 
               ctx.strokeStyle = '#22c55e';
-              ctx.lineWidth = 2.4;
+              ctx.lineWidth = 2.2;
               ctx.stroke();
 
               ctx.restore();
@@ -631,9 +593,9 @@ export const CameraView: React.FC<Props> = ({
     }
   }, [isAllCompleted, stopTracks]);
 
-  const zoomTransform = !hardwareZoomAvailable && zoomLevel > 1 ? `scale(${zoomLevel})` : '';
-  const mirrorTransform = isFrontCamera ? 'scaleX(-1)' : '';
-  const sharedTransform = `${mirrorTransform} ${zoomTransform}`.trim();
+  // If hardware zoom is supported, zoom is applied optically via track.applyConstraints() (zero CSS scale).
+  // If CSS digital zoom fallback is used, apply transform to the shared parent wrapper so <video> and <canvas> scale 1:1 together!
+  const digitalZoomCss = !hardwareZoomAvailable && zoomLevel > 1 ? `scale(${zoomLevel})` : '';
 
   return (
     <div
@@ -644,30 +606,33 @@ export const CameraView: React.FC<Props> = ({
       }`}
       dir="ltr"
     >
-      {/* Full-Screen Edge-to-Edge Camera View */}
-      <video
-        ref={videoRef}
-        autoPlay
-        playsInline
-        muted
+      {/* Shared Zoom Wrapper: guarantees <video> and <canvas> are 100% pixel-locked at 1x, 2x, and 3x */}
+      <div
         style={{
-          transform: sharedTransform || undefined,
+          transform: digitalZoomCss || undefined,
           transformOrigin: 'center center',
         }}
-        className="absolute inset-0 w-full h-full object-cover transition-transform duration-200"
-      />
+        className="absolute inset-0 w-full h-full transition-transform duration-200"
+      >
+        <video
+          ref={videoRef}
+          autoPlay
+          playsInline
+          muted
+          style={{
+            transform: isFrontCamera ? 'scaleX(-1)' : undefined,
+            transformOrigin: 'center center',
+          }}
+          className="absolute inset-0 w-full h-full object-cover"
+        />
 
-      {/* Retina-Synced 60fps Full-Screen Canvas Overlay (shares exact transform with videoEl) */}
-      <canvas
-        ref={canvasRef}
-        style={{
-          transform: sharedTransform || undefined,
-          transformOrigin: 'center center',
-        }}
-        className="absolute inset-0 w-full h-full pointer-events-none z-10 transition-transform duration-200"
-      />
+        <canvas
+          ref={canvasRef}
+          className="absolute inset-0 w-full h-full pointer-events-none z-10"
+        />
+      </div>
 
-      {/* 1. TOP MINIMALIST GEOMETRIC BAR (No live raw-text debug bar below it!) */}
+      {/* 1. TOP MINIMALIST GEOMETRIC BAR */}
       <div className="absolute top-20 inset-x-0 z-30 px-4 flex flex-col items-center gap-2 pointer-events-auto max-w-md mx-auto">
         <div className="w-full h-12 px-3 bg-white/95 dark:bg-[#0f0f0f]/95 backdrop-blur-md border border-[#cbd5e1] dark:border-white/75 flex items-center justify-between gap-2 shadow-lg">
           {/* Back Button */}

@@ -51,24 +51,36 @@ export function normalizeText(input: string): string {
 }
 
 /**
- * Fast normalized alphanumeric cleaner for O(1) multi-target lookup
+ * Fast normalized alphanumeric cleaner for O(1) multi-target lookup.
  */
 export function cleanNormalized(input: string): string {
   if (!input) return '';
   return normalizeText(input).replace(/[^a-z0-9\u0600-\u06FF]/gu, '');
 }
 
+/**
+ * Normalizes common monospace thermal-printer OCR confusions (O<->0, I/l<->1)
+ * ONLY for exact substring verification on alphanumeric serial codes.
+ */
+export function normalizeSerialLookalikes(input: string): string {
+  if (!input) return '';
+  return input
+    .replace(/[oO]/g, '0')
+    .replace(/[iIlL]/g, '1');
+}
+
 export interface PreparedTarget {
   item: ChecklistItem;
   rawTrimmed: string;
   cleanTarget: string;
+  serialLookalikeTarget: string;
   parts: string[];
   isMultiWord: boolean;
 }
 
 /**
  * Pre-normalizes all active checklist items into an indexed lookup array
- * before scanning the full-screen OCR word matrix.
+ * before scanning the OCR word matrix.
  */
 export function prepareTargets(items: ChecklistItem[]): PreparedTarget[] {
   const prepared: PreparedTarget[] = [];
@@ -87,6 +99,7 @@ export function prepareTargets(items: ChecklistItem[]): PreparedTarget[] {
       item,
       rawTrimmed,
       cleanTarget,
+      serialLookalikeTarget: normalizeSerialLookalikes(cleanTarget),
       parts: rawParts,
       isMultiWord: rawParts.length > 1,
     });
@@ -96,8 +109,8 @@ export function prepareTargets(items: ChecklistItem[]): PreparedTarget[] {
 
 /**
  * Smart Sub-Token Slicing:
- * If a target ("netlify") is found inside a longer OCR token ("camscanner07.netlify.app"),
- * calculates its exact horizontal slice inside word.bbox.
+ * If a target ("PE510" or "netlify") is found inside a longer OCR token ("PE51000652D" or "camscanner07.netlify.app"),
+ * calculates its exact horizontal slice (slicedX0, slicedX1) inside word.bbox.
  */
 export function sliceSubTokenBbox(
   bbox: { x0: number; y0: number; x1: number; y1: number },
@@ -112,7 +125,12 @@ export function sliceSubTokenBbox(
   // 1. Direct index on normalized raw token (preserves punctuation spacing like dots/hyphens)
   const normRawToken = normalizeText(rawToken);
   const normRawTarget = normalizeText(rawTarget);
-  const rawIdx = normRawToken.indexOf(normRawTarget);
+  let rawIdx = normRawToken.indexOf(normRawTarget);
+  if (rawIdx < 0) {
+    rawIdx = normalizeSerialLookalikes(normRawToken).indexOf(
+      normalizeSerialLookalikes(normRawTarget)
+    );
+  }
   if (rawIdx >= 0 && normRawToken.length > normRawTarget.length) {
     const startRatio = rawIdx / normRawToken.length;
     const widthRatio = Math.min(1 - startRatio, normRawTarget.length / normRawToken.length);
@@ -127,7 +145,12 @@ export function sliceSubTokenBbox(
   }
 
   // 2. Fallback to cleaned alphanumeric ratio
-  const idx = cleanToken.indexOf(cleanTarget);
+  let idx = cleanToken.indexOf(cleanTarget);
+  if (idx < 0) {
+    idx = normalizeSerialLookalikes(cleanToken).indexOf(
+      normalizeSerialLookalikes(cleanTarget)
+    );
+  }
   if (idx >= 0 && cleanToken.length > cleanTarget.length) {
     const startRatio = idx / cleanToken.length;
     const widthRatio = Math.min(1 - startRatio, cleanTarget.length / cleanToken.length);
@@ -145,32 +168,8 @@ export function sliceSubTokenBbox(
 }
 
 /**
- * Levenshtein Distance for fuzzy matching OCR errors
- */
-function levenshteinDistance(s1: string, s2: string): number {
-  const m = s1.length;
-  const n = s2.length;
-  const dp: number[][] = Array.from({ length: m + 1 }, () => Array(n + 1).fill(0));
-
-  for (let i = 0; i <= m; i++) dp[i][0] = i;
-  for (let j = 0; j <= n; j++) dp[0][j] = j;
-
-  for (let i = 1; i <= m; i++) {
-    for (let j = 1; j <= n; j++) {
-      const cost = s1[i - 1] === s2[j - 1] ? 0 : 1;
-      dp[i][j] = Math.min(
-        dp[i - 1][j] + 1,
-        dp[i][j - 1] + 1,
-        dp[i - 1][j - 1] + cost
-      );
-    }
-  }
-
-  return dp[m][n];
-}
-
-/**
- * Evaluates whether an OCR detected word (or multi-word slice) matches the target query.
+ * Evaluates whether an OCR detected word strictly matches the target query
+ * without false-positive fuzzy matches on unrelated serial numbers.
  */
 export function checkMatch(
   detectedRaw: string,
@@ -197,18 +196,14 @@ export function checkMatch(
   }
 
   if (normDetected.includes(normTarget)) {
-    return { isMatch: true, score: 0.95 };
+    return { isMatch: true, score: 0.98 };
   }
 
-  const lenDiff = Math.abs(normDetected.length - normTarget.length);
-  const maxLen = Math.max(normDetected.length, normTarget.length);
-  if (maxLen >= 4 && lenDiff <= 1) {
-    const dist = levenshteinDistance(normDetected, normTarget);
-    const allowedTypos = maxLen >= 7 ? 2 : 1;
-    if (dist <= allowedTypos) {
-      const similarity = 1 - dist / maxLen;
-      return { isMatch: true, score: Math.max(0.82, Number(similarity.toFixed(2))) };
-    }
+  if (
+    normTarget.length >= 3 &&
+    normalizeSerialLookalikes(normDetected).includes(normalizeSerialLookalikes(normTarget))
+  ) {
+    return { isMatch: true, score: 0.95 };
   }
 
   return { isMatch: false, score: 0 };
