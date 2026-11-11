@@ -19,7 +19,7 @@ interface RawLineItem {
 
 const FAST_LANG_CDN = 'https://tessdata.projectnaptha.com/4.0.0_fast';
 const PARALLEL_WORKERS = 2;
-const OCR_TARGET_WIDTH = 720;
+const OCR_TARGET_WIDTH = 580;
 
 /**
  * Foolproof cleaner for English, Kurdish, and Arabic text/numbers
@@ -30,6 +30,38 @@ function clean(str: string): string {
     .toLowerCase()
     .trim()
     .replace(/[^\w\u0600-\u06FF]/g, '');
+}
+
+/**
+ * Tightens a word's horizontal bounding box when the OCR token contains extra characters
+ * around the target query (e.g. "Price:50" or "after," when searching "50" or "after").
+ */
+function tightenWordBbox(
+  bbox: { x0: number; y0: number; x1: number; y1: number },
+  rawWordText: string,
+  targetText: string
+): { x0: number; y0: number; x1: number; y1: number } {
+  const cWord = clean(rawWordText);
+  const cTarget = clean(targetText);
+  if (
+    cWord.length > cTarget.length + 1 &&
+    cTarget.length >= 2 &&
+    cWord.includes(cTarget)
+  ) {
+    const idx = cWord.indexOf(cTarget);
+    if (idx >= 0) {
+      const w = bbox.x1 - bbox.x0;
+      const startRatio = idx / cWord.length;
+      const endRatio = (idx + cTarget.length) / cWord.length;
+      return {
+        x0: bbox.x0 + w * startRatio,
+        y0: bbox.y0,
+        x1: bbox.x0 + w * endRatio,
+        y1: bbox.y1,
+      };
+    }
+  }
+  return bbox;
 }
 
 export function useOCRScanner(selectedLang: OcrLanguage) {
@@ -44,7 +76,7 @@ export function useOCRScanner(selectedLang: OcrLanguage) {
 
   const schedulerRef = useRef<Scheduler | null>(null);
   const workersRef = useRef<Worker[]>([]);
-  // Dual offscreen canvas pool so 2 parallel workers never overwrite each other's frame
+  // Dual 580px offscreen canvas pool so 2 parallel workers never overwrite each other's frame
   const canvasPoolRef = useRef<[HTMLCanvasElement | null, HTMLCanvasElement | null]>([null, null]);
   const poolIndexRef = useRef<number>(0);
   const activeJobsRef = useRef<number>(0);
@@ -52,7 +84,7 @@ export function useOCRScanner(selectedLang: OcrLanguage) {
   const jobSeqCounterRef = useRef<number>(0);
   const previousMatchedItemIdsRef = useRef<Set<string>>(new Set());
 
-  // Initialize Dual-Worker Tesseract v5 Scheduler with 4.0.0_fast quantized models
+  // Initialize Dual-Worker Tesseract v5 Scheduler with 4.0.0_fast + PSM 11 + DAWG disabled
   useEffect(() => {
     let isCancelled = false;
 
@@ -62,7 +94,6 @@ export function useOCRScanner(selectedLang: OcrLanguage) {
       setInitProgress(15);
       setInitStatusText(`Loading Fast ${selectedLang}...`);
 
-      // Terminate any previous scheduler/workers
       if (schedulerRef.current) {
         try {
           await schedulerRef.current.terminate();
@@ -103,13 +134,14 @@ export function useOCRScanner(selectedLang: OcrLanguage) {
                   : undefined,
             });
           } catch {
-            // Fallback to default CDN if fast CDN is unreachable
             worker = await createWorker(selectedLang, 1);
           }
 
-          // PSM 6 + disable unused output formats (HOCR, TSV, BOX, UNLV, OSD) for ~40% faster recognition
+          // PSM 11 (Sparse text - ultra fast) + disable dictionary DAWGs & unused serialization
           await worker.setParameters({
-            tessedit_pageseg_mode: PSM.SINGLE_BLOCK,
+            tessedit_pageseg_mode: PSM.SPARSE_TEXT,
+            load_system_dawg: '0',
+            load_freq_dawg: '0',
             tessjs_create_hocr: '0',
             tessjs_create_tsv: '0',
             tessjs_create_box: '0',
@@ -120,7 +152,6 @@ export function useOCRScanner(selectedLang: OcrLanguage) {
           return worker;
         };
 
-        // Spawn both workers in parallel
         const createdWorkers = await Promise.all(
           Array.from({ length: PARALLEL_WORKERS }, (_, idx) => createFastWorker(idx))
         );
@@ -140,7 +171,7 @@ export function useOCRScanner(selectedLang: OcrLanguage) {
         setIsInitializing(false);
         setWorkerStatus('ready');
         setInitProgress(100);
-        setInitStatusText('Ready / High-Speed Scanning...');
+        setInitStatusText('Ready / Scanning...');
         setError(null);
       } catch (err) {
         if (!isCancelled) {
@@ -166,7 +197,7 @@ export function useOCRScanner(selectedLang: OcrLanguage) {
     };
   }, [selectedLang]);
 
-  // High-speed overlapping scan function: dispatches up to 2 concurrent jobs across the dual-worker scheduler
+  // Ultra-fast raw 580px frame OCR scan (~100ms cycle)
   const scanSource = useCallback(
     async (
       source: HTMLVideoElement | HTMLCanvasElement | HTMLImageElement,
@@ -213,11 +244,10 @@ export function useOCRScanner(selectedLang: OcrLanguage) {
       const startTime = performance.now();
 
       try {
-        // 720px width = 2x fewer pixels than 1024px -> cuts WASM inference time in half while keeping crisp text
+        // Fixed compact width of 580px (height scaled proportionally to videoHeight / videoWidth)
         const ocrW = OCR_TARGET_WIDTH;
         const ocrH = Math.max(1, Math.round((videoH / videoW) * ocrW));
 
-        // Pick dedicated canvas slot (0 or 1) so concurrent workers never clobber each other's frame
         const slot = poolIndexRef.current % 2;
         poolIndexRef.current = (poolIndexRef.current + 1) % 2;
 
@@ -235,12 +265,11 @@ export function useOCRScanner(selectedLang: OcrLanguage) {
           return null;
         }
 
-        // Direct, raw drawImage — zero filter overhead, 100% iOS Safari hardware accelerated
+        // Draw raw <video> frame directly — ZERO CSS/SVG/pixel filters
         ocrCtx.drawImage(source, 0, 0, ocrW, ocrH);
 
         const ret = await schedulerRef.current.addJob('recognize', ocrCanvas);
 
-        // Ignore out-of-order stale frame if a newer parallel frame already completed
         if (currentSeq < latestCompletedSeqRef.current) {
           return null;
         }
@@ -249,11 +278,10 @@ export function useOCRScanner(selectedLang: OcrLanguage) {
         const data = ret.data;
         const rawFullText = (data.text || '').trim();
 
-        // Update top debug bar with raw detected text preview
         const sanitizedPreview = rawFullText.replace(/\s+/g, ' ').slice(0, 60);
         setRawTextPreview(sanitizedPreview);
 
-        // Collect all words and lines from Tesseract output
+        // Extract words and lines
         const wordsList: RawWordItem[] = [];
         const linesList: RawLineItem[] = [];
 
@@ -263,7 +291,7 @@ export function useOCRScanner(selectedLang: OcrLanguage) {
             if (w.text && w.text.trim() && w.bbox) {
               wordsList.push({
                 text: w.text.trim(),
-                confidence: Math.round(w.confidence || 80),
+                confidence: Math.round(w.confidence || 85),
                 bbox: w.bbox,
               });
             }
@@ -278,7 +306,7 @@ export function useOCRScanner(selectedLang: OcrLanguage) {
                 if (w.text && w.text.trim() && w.bbox) {
                   const item: RawWordItem = {
                     text: w.text.trim(),
-                    confidence: Math.round(w.confidence || 80),
+                    confidence: Math.round(w.confidence || 85),
                     bbox: w.bbox,
                   };
                   lineWords.push(item);
@@ -291,7 +319,7 @@ export function useOCRScanner(selectedLang: OcrLanguage) {
             if (line.text && line.text.trim() && line.bbox) {
               linesList.push({
                 text: line.text.trim(),
-                confidence: Math.round(line.confidence || 80),
+                confidence: Math.round(line.confidence || 85),
                 bbox: line.bbox,
                 words: lineWords,
               });
@@ -311,7 +339,7 @@ export function useOCRScanner(selectedLang: OcrLanguage) {
                         if (w.text && w.text.trim() && w.bbox) {
                           const item: RawWordItem = {
                             text: w.text.trim(),
-                            confidence: Math.round(w.confidence || 80),
+                            confidence: Math.round(w.confidence || 85),
                             bbox: w.bbox,
                           };
                           lineWords.push(item);
@@ -322,7 +350,7 @@ export function useOCRScanner(selectedLang: OcrLanguage) {
                     if (l.text && l.text.trim() && l.bbox) {
                       linesList.push({
                         text: l.text.trim(),
-                        confidence: Math.round(l.confidence || 80),
+                        confidence: Math.round(l.confidence || 85),
                         bbox: l.bbox,
                         words: lineWords,
                       });
@@ -337,14 +365,13 @@ export function useOCRScanner(selectedLang: OcrLanguage) {
         const matchedWords: MatchedWord[] = [];
         const itemToMatchesMap = new Map<string, MatchedWord[]>();
 
-        // Loop through user's active checklist items
         for (const targetItem of targetItems) {
           const cleanTarget = clean(targetItem.text);
           if (!cleanTarget) continue;
 
           let matchedInWords = false;
 
-          // 1. Check every word in data.words first
+          // 1. Word-level match with tight sub-word proportional bbox slicing
           for (let i = 0; i < wordsList.length; i++) {
             const w = wordsList[i];
             const cleanWord = clean(w.text);
@@ -358,12 +385,13 @@ export function useOCRScanner(selectedLang: OcrLanguage) {
 
             if (isDirectMatch || isReverseMatch) {
               matchedInWords = true;
+              const tightBbox = tightenWordBbox(w.bbox, w.text, targetItem.text);
               const matchObj: MatchedWord = {
-                id: `w-${targetItem.id}-${i}-${Date.now()}`,
+                id: `w-${targetItem.id}-${i}`,
                 text: w.text,
                 normalizedText: cleanWord,
                 confidence: w.confidence,
-                bbox: w.bbox,
+                bbox: tightBbox,
                 isMatch: true,
                 score: isDirectMatch ? 1.0 : 0.9,
                 matchedItemId: targetItem.id,
@@ -378,7 +406,7 @@ export function useOCRScanner(selectedLang: OcrLanguage) {
             }
           }
 
-          // 2. Fallback: check data.lines if not matched by individual word
+          // 2. Multi-word line fallback (uses tight union of matching words inside the line)
           if (!matchedInWords) {
             for (let lIdx = 0; lIdx < linesList.length; lIdx++) {
               const line = linesList[lIdx];
@@ -412,7 +440,7 @@ export function useOCRScanner(selectedLang: OcrLanguage) {
                   : line.bbox;
 
               const matchObj: MatchedWord = {
-                id: `l-${targetItem.id}-${lIdx}-${Date.now()}`,
+                id: `l-${targetItem.id}-${lIdx}`,
                 text: line.text,
                 normalizedText: cleanLine,
                 confidence: line.confidence,

@@ -28,17 +28,25 @@ interface Props {
   onRestartBatch: () => void;
 }
 
-interface InterpolatedBox {
+interface StickyBoxTrack {
   key: string;
   matchedItemId?: string;
+  // Coordinates in 580px ocrCanvas space
+  bbox: { x0: number; y0: number; x1: number; y1: number };
+  // Screen-space smoothed coordinates
   x: number;
   y: number;
   w: number;
   h: number;
+  // Screen-space velocity for sticky prediction between ~100ms OCR cycles
+  vx: number;
+  vy: number;
   targetX: number;
   targetY: number;
   targetW: number;
   targetH: number;
+  lastSeenAt: number;
+  initialized: boolean;
 }
 
 export const CameraView: React.FC<Props> = ({
@@ -70,11 +78,11 @@ export const CameraView: React.FC<Props> = ({
   const [hardwareZoomAvailable, setHardwareZoomAvailable] = useState(false);
   const [zoomMinMax, setZoomMinMax] = useState<{ min: number; max: number }>({ min: 1, max: 3 });
 
-  // Auto (~150ms post-scan delay) vs Manual (Tap to scan)
+  // Auto (~100ms cycle) vs Manual (Tap to scan)
   const [scanMode, setScanMode] = useState<'auto' | 'manual'>('auto');
   const [manualScanPulse, setManualScanPulse] = useState(false);
 
-  // OCR Hook (Tesseract v5 + PSM 6 + Raw 1024px canvas)
+  // OCR Hook (Tesseract v5 + PSM 11 + Raw 580px canvas + 4.0.0_fast dual-worker scheduler)
   const {
     isInitializing,
     initStatusText,
@@ -85,23 +93,90 @@ export const CameraView: React.FC<Props> = ({
     scanSource,
   } = useOCRScanner(ocrLanguage);
 
-  const targetBoxesRef = useRef<MatchedWord[]>([]);
-  const interpolatedBoxesRef = useRef<InterpolatedBox[]>([]);
+  const stickyTracksRef = useRef<StickyBoxTrack[]>([]);
   const detectedGroupsRef = useRef<DetectedMatchGroup[]>([]);
-  const scanDimsRef = useRef<{ w: number; h: number }>({ w: 720, h: 405 });
+  const scanDimsRef = useRef<{ w: number; h: number }>({ w: 580, h: 326 });
   const activeChecklistRef = useRef<ChecklistItem[]>(checklist);
   activeChecklistRef.current = checklist;
 
-  // Sync latest OCR matched bounding boxes into targetBoxesRef
+  // Sync latest OCR matched bounding boxes into stickyTracksRef with anti-flicker grace window
   useEffect(() => {
     if (!lastScanResult) return;
 
-    targetBoxesRef.current = lastScanResult.matchedWords;
+    const now = performance.now();
     detectedGroupsRef.current = lastScanResult.detectedGroups;
     scanDimsRef.current = {
       w: lastScanResult.frameWidth,
       h: lastScanResult.frameHeight,
     };
+
+    const currentTracks = stickyTracksRef.current;
+    const incomingWords = lastScanResult.matchedWords;
+    const updatedTracks: StickyBoxTrack[] = [];
+    const usedPrevIndices = new Set<number>();
+
+    for (let i = 0; i < incomingWords.length; i++) {
+      const m = incomingWords[i];
+      const mCx = (m.bbox.x0 + m.bbox.x1) * 0.5;
+      const mCy = (m.bbox.y0 + m.bbox.y1) * 0.5;
+
+      let bestPrevIdx = -1;
+      let bestDist = 130; // max distance in 580px OCR space to associate same word track
+
+      for (let j = 0; j < currentTracks.length; j++) {
+        if (usedPrevIndices.has(j)) continue;
+        const p = currentTracks[j];
+        if (p.matchedItemId !== m.matchedItemId) continue;
+
+        const pCx = (p.bbox.x0 + p.bbox.x1) * 0.5;
+        const pCy = (p.bbox.y0 + p.bbox.y1) * 0.5;
+        const dist = Math.hypot(mCx - pCx, mCy - pCy);
+        if (dist < bestDist) {
+          bestDist = dist;
+          bestPrevIdx = j;
+        }
+      }
+
+      if (bestPrevIdx >= 0) {
+        usedPrevIndices.add(bestPrevIdx);
+        const prev = currentTracks[bestPrevIdx];
+        updatedTracks.push({
+          ...prev,
+          bbox: m.bbox,
+          lastSeenAt: now,
+        });
+      } else {
+        updatedTracks.push({
+          key: `${m.id}-${now}-${i}`,
+          matchedItemId: m.matchedItemId,
+          bbox: m.bbox,
+          x: 0,
+          y: 0,
+          w: 0,
+          h: 0,
+          vx: 0,
+          vy: 0,
+          targetX: 0,
+          targetY: 0,
+          targetW: 0,
+          targetH: 0,
+          lastSeenAt: now,
+          initialized: false,
+        });
+      }
+    }
+
+    // Keep recently seen tracks alive during brief single-frame motion blur (240ms hold window)
+    for (let j = 0; j < currentTracks.length; j++) {
+      if (usedPrevIndices.has(j)) continue;
+      const p = currentTracks[j];
+      const stillInQueue = activeChecklistRef.current.some((item) => item.id === p.matchedItemId);
+      if (stillInQueue && now - p.lastSeenAt < 240) {
+        updatedTracks.push(p);
+      }
+    }
+
+    stickyTracksRef.current = updatedTracks;
   }, [lastScanResult]);
 
   // Clean up media tracks immediately to release camera indicator on iOS/Android
@@ -233,15 +308,13 @@ export const CameraView: React.FC<Props> = ({
   const flipCamera = () => {
     setIsFrontCamera((prev) => !prev);
     setIsTorchOn(false);
-    targetBoxesRef.current = [];
-    interpolatedBoxesRef.current = [];
+    stickyTracksRef.current = [];
   };
 
   // Apply Hardware / Digital Zoom (1x, 2x, 3x)
   const applyZoom = async (level: number) => {
     setZoomLevel(level);
-    targetBoxesRef.current = [];
-    interpolatedBoxesRef.current = [];
+    stickyTracksRef.current = [];
     if (!streamRef.current) return;
     const videoTrack = streamRef.current.getVideoTracks()[0];
 
@@ -271,7 +344,7 @@ export const CameraView: React.FC<Props> = ({
     }
   }, [isInitializing, matchMode, scanSource]);
 
-  // High-Speed Overlapping Dual-Worker Dispatch Loop (staggered every 60ms for ~100ms-140ms latency)
+  // Ultra-Fast Raw Frame OCR Loop (~50ms overlapping dual-worker dispatch -> ~100ms effective cycle)
   useEffect(() => {
     if (scanMode !== 'auto' || isInitializing) return;
 
@@ -281,18 +354,17 @@ export const CameraView: React.FC<Props> = ({
 
       if (video && currentItems.length > 0) {
         if (video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA && video.videoWidth > 0) {
-          // Non-blocking call: useOCRScanner dispatches to whichever of the 2 workers is free!
           void scanSource(video, currentItems, matchMode, true, true);
         }
       }
-    }, 60);
+    }, 50);
 
     return () => {
       clearInterval(intervalId);
     };
   }, [isInitializing, scanSource, matchMode, scanMode]);
 
-  // Smooth 60fps Box Rendering (Pure Coordinate Interpolation — Zero Pixel Loops)
+  // Sticky 60fps Green Pill Box Renderer (Velocity-Assisted Coordinate Interpolation)
   useEffect(() => {
     let animId: number;
 
@@ -329,85 +401,86 @@ export const CameraView: React.FC<Props> = ({
             const offsetX = (screenW - srcW * scale) / 2;
             const offsetY = (screenH - srcH * scale) / 2;
 
-            const rawTargets = targetBoxesRef.current;
-            const currentInterp = interpolatedBoxesRef.current;
-            const nextInterp: InterpolatedBox[] = [];
+            const now = performance.now();
+            // Prune expired tracks (> 280ms without OCR confirmation)
+            const activeTracks = stickyTracksRef.current.filter(
+              (tr) => now - tr.lastSeenAt < 280
+            );
+            stickyTracksRef.current = activeTracks;
 
-            for (let i = 0; i < rawTargets.length; i++) {
-              const m = rawTargets[i];
-              let tx = m.bbox.x0 * scale + offsetX;
-              const ty = m.bbox.y0 * scale + offsetY;
-              const tw = (m.bbox.x1 - m.bbox.x0) * scale;
-              const th = (m.bbox.y1 - m.bbox.y0) * scale;
+            for (let i = 0; i < activeTracks.length; i++) {
+              const tr = activeTracks[i];
+              let tx = tr.bbox.x0 * scale + offsetX;
+              const ty = tr.bbox.y0 * scale + offsetY;
+              const tw = (tr.bbox.x1 - tr.bbox.x0) * scale;
+              const th = (tr.bbox.y1 - tr.bbox.y0) * scale;
 
               if (isFrontCamera) {
                 tx = screenW - (tx + tw);
               }
 
-              // Find closest previously interpolated box for smooth 60fps transition
-              const prev = currentInterp.find(
-                (p) =>
-                  p.matchedItemId === m.matchedItemId &&
-                  Math.hypot(p.targetX - tx, p.targetY - ty) < 160
-              );
-
-              if (prev) {
-                const lerp = 0.55;
-                nextInterp.push({
-                  key: prev.key,
-                  matchedItemId: m.matchedItemId,
-                  x: prev.x + (tx - prev.x) * lerp,
-                  y: prev.y + (ty - prev.y) * lerp,
-                  w: prev.w + (tw - prev.w) * lerp,
-                  h: prev.h + (th - prev.h) * lerp,
-                  targetX: tx,
-                  targetY: ty,
-                  targetW: tw,
-                  targetH: th,
-                });
+              if (!tr.initialized) {
+                tr.x = tx;
+                tr.y = ty;
+                tr.w = tw;
+                tr.h = th;
+                tr.targetX = tx;
+                tr.targetY = ty;
+                tr.targetW = tw;
+                tr.targetH = th;
+                tr.initialized = true;
               } else {
-                nextInterp.push({
-                  key: m.id,
-                  matchedItemId: m.matchedItemId,
-                  x: tx,
-                  y: ty,
-                  w: tw,
-                  h: th,
-                  targetX: tx,
-                  targetY: ty,
-                  targetW: tw,
-                  targetH: th,
-                });
+                // If target position just updated from OCR, compute instantaneous velocity
+                if (tr.targetX !== tx || tr.targetY !== ty) {
+                  tr.vx = (tx - tr.targetX) * 0.25;
+                  tr.vy = (ty - tr.targetY) * 0.25;
+                  tr.targetX = tx;
+                  tr.targetY = ty;
+                  tr.targetW = tw;
+                  tr.targetH = th;
+                } else {
+                  // Apply damped velocity prediction between OCR frames so box glides with camera motion
+                  tr.targetX += tr.vx;
+                  tr.targetY += tr.vy;
+                  tr.vx *= 0.82;
+                  tr.vy *= 0.82;
+                }
+
+                // High-speed 60fps sticky spring interpolation
+                const lerp = 0.62;
+                tr.x += (tr.targetX - tr.x) * lerp;
+                tr.y += (tr.targetY - tr.y) * lerp;
+                tr.w += (tr.targetW - tr.w) * lerp;
+                tr.h += (tr.targetH - tr.h) * lerp;
               }
-            }
 
-            interpolatedBoxesRef.current = nextInterp;
-            const time = performance.now() * 0.003;
-
-            for (let i = 0; i < nextInterp.length; i++) {
-              const b = nextInterp[i];
+              // Tight green pill box geometry
               const padX = 4;
-              const padY = 3;
-              const rx = b.x - padX;
-              const ry = b.y - padY;
-              const rw = b.w + padX * 2;
-              const rh = b.h + padY * 2;
+              const padY = 2;
+              const rx = tr.x - padX;
+              const ry = tr.y - padY;
+              const rw = tr.w + padX * 2;
+              const rh = tr.h + padY * 2;
+              const pillRadius = Math.min(8, Math.max(4, rh * 0.32));
 
-              const pulse = 0.9 + Math.sin(time * 3.5 + i) * 0.1;
+              // Smooth fade-out if track is at the end of its hold window
+              const ageMs = now - tr.lastSeenAt;
+              const fadeAlpha = ageMs > 180 ? Math.max(0, 1 - (ageMs - 180) / 100) : 1;
 
               ctx.save();
+              ctx.globalAlpha = fadeAlpha;
               ctx.shadowColor = '#22c55e';
-              ctx.shadowBlur = 10 * pulse;
+              ctx.shadowBlur = 8;
 
-              // Subtle translucent green fill
-              ctx.fillStyle = `rgba(34, 197, 94, ${0.2 * pulse})`;
+              // Tight translucent green pill fill
+              ctx.fillStyle = 'rgba(34, 197, 94, 0.24)';
               ctx.beginPath();
-              ctx.roundRect(rx, ry, rw, rh, 2);
+              ctx.roundRect(rx, ry, rw, rh, pillRadius);
               ctx.fill();
 
-              // Crisp glowing border stroke
-              ctx.strokeStyle = `rgba(34, 197, 94, ${0.95 * pulse})`;
-              ctx.lineWidth = 2.2;
+              // Crisp bright green pill stroke
+              ctx.strokeStyle = '#22c55e';
+              ctx.lineWidth = 2.4;
               ctx.stroke();
 
               ctx.restore();
@@ -434,8 +507,7 @@ export const CameraView: React.FC<Props> = ({
       setSuccessToast(null);
     }, 1800);
 
-    targetBoxesRef.current = targetBoxesRef.current.filter((w) => w.matchedItemId !== item.id);
-    interpolatedBoxesRef.current = interpolatedBoxesRef.current.filter(
+    stickyTracksRef.current = stickyTracksRef.current.filter(
       (b) => b.matchedItemId !== item.id
     );
     detectedGroupsRef.current = detectedGroupsRef.current.filter((g) => g.item.id !== item.id);
