@@ -21,11 +21,13 @@ interface StickyRecentMatch {
   word: MatchedWord;
   item: ChecklistItem;
   timestamp: number;
+  missedFrames: number;
 }
 
 const FAST_LANG_CDN = 'https://tessdata.projectnaptha.com/4.0.0_fast';
 export const OCR_CANVAS_WIDTH = 1024;
-const STICKY_MEMORY_MS = 450;
+const STICKY_MEMORY_MS = 3500;
+const MIN_MISSED_SCANS_TO_KEEP = 6;
 
 // Module-level singleton worker cache so opening the camera has 0ms initialization delay
 let singletonWorker: Worker | null = null;
@@ -581,38 +583,58 @@ export function useOCRScanner(selectedLang: OcrLanguage, liveChecklist: Checklis
           }
         }
 
-        // Fuse with 450ms sticky memory (strictly excluding any completed tombstones)
+        // Fuse with 3500ms / 6-missed-scans persistent lock-on memory (strictly excluding completed tombstones)
         const now = performance.now();
         const activeTargetIds = new Set(freshTargetItems.map((t) => t.id));
-        const survivingMemory = recentMatchesRef.current.filter(
-          (entry) =>
-            now - entry.timestamp < STICKY_MEMORY_MS &&
-            activeTargetIds.has(entry.item.id) &&
-            !completedTombstonesRef.current.has(entry.item.id)
-        );
-
         const targetById = new Map(freshTargetItems.map((t) => [t.id, t]));
-        const dedupRadius = 110; // in 1024px ocrCanvas space
+
+        // Group current frame matches by target item ID (pick highest confidence/score or keep multiple distinct instances)
+        const seenItemIdsThisScan = new Set<string>();
+        const survivingMemory: StickyRecentMatch[] = [];
+
+        // Keep existing locked-on entries that are still active and within 3500ms or <= 6 missed scans
+        for (const prev of recentMatchesRef.current) {
+          if (
+            !activeTargetIds.has(prev.item.id) ||
+            completedTombstonesRef.current.has(prev.item.id)
+          ) {
+            continue;
+          }
+          const nextMissed = prev.missedFrames + 1;
+          if (now - prev.timestamp < STICKY_MEMORY_MS || nextMissed <= MIN_MISSED_SCANS_TO_KEEP) {
+            survivingMemory.push({
+              ...prev,
+              missedFrames: nextMissed,
+            });
+          }
+        }
 
         for (const w of currentFrameWords) {
           if (!w.matchedItemId || completedTombstonesRef.current.has(w.matchedItemId)) continue;
           const item = targetById.get(w.matchedItemId);
           if (!item) continue;
 
-          const wCx = (w.bbox.x0 + w.bbox.x1) * 0.5;
-          const wCy = (w.bbox.y0 + w.bbox.y1) * 0.5;
+          // Match to existing tracked entry for this target item anywhere on screen
+          const existingIdx = survivingMemory.findIndex(
+            (m) => m.item.id === item.id && !seenItemIdsThisScan.has(`${item.id}-${m.word.id}`)
+          );
 
-          const existingIdx = survivingMemory.findIndex((m) => {
-            if (m.item.id !== item.id) return false;
-            const mCx = (m.word.bbox.x0 + m.word.bbox.x1) * 0.5;
-            const mCy = (m.word.bbox.y0 + m.word.bbox.y1) * 0.5;
-            return Math.hypot(wCx - mCx, wCy - mCy) < dedupRadius;
-          });
-
-          if (existingIdx >= 0) {
-            survivingMemory[existingIdx] = { word: w, item, timestamp: now };
-          } else {
-            survivingMemory.push({ word: w, item, timestamp: now });
+          if (existingIdx >= 0 && !seenItemIdsThisScan.has(item.id)) {
+            seenItemIdsThisScan.add(item.id);
+            survivingMemory[existingIdx] = {
+              word: w,
+              item,
+              timestamp: now,
+              missedFrames: 0,
+            };
+          } else if (!seenItemIdsThisScan.has(item.id)) {
+            seenItemIdsThisScan.add(item.id);
+            survivingMemory.push({
+              word: w,
+              item,
+              timestamp: now,
+              missedFrames: 0,
+            });
           }
         }
 
@@ -646,8 +668,8 @@ export function useOCRScanner(selectedLang: OcrLanguage, liveChecklist: Checklis
 
         const endTime = performance.now();
         const result: ScanResult = {
-          allWords: fusedMatchedWords,
-          matchedWords: fusedMatchedWords,
+          allWords: currentFrameWords,
+          matchedWords: currentFrameWords,
           detectedGroups,
           fullText: rawFullText,
           processingTimeMs: Math.round(endTime - startTime),

@@ -31,23 +31,20 @@ interface Props {
 interface StickyBoxTrack {
   key: string;
   matchedItemId?: string;
-  // Coordinates in 580px ocrCanvas space
+  // Coordinates in 1024px ocrCanvas space
   bbox: { x0: number; y0: number; x1: number; y1: number };
   // Screen-space smoothed coordinates
   x: number;
   y: number;
   w: number;
   h: number;
-  // Screen-space velocity for sticky prediction between ~100ms OCR cycles
-  vx: number;
-  vy: number;
-  targetX: number;
-  targetY: number;
-  targetW: number;
-  targetH: number;
-  lastSeenAt: number;
+  lastSeenTimestamp: number;
+  missedFrames: number;
   initialized: boolean;
 }
+
+const LOCK_ON_TTL_MS = 3500;
+const MIN_MISSED_SCANS_KEEP = 6;
 
 export const CameraView: React.FC<Props> = ({
   checklist,
@@ -82,7 +79,7 @@ export const CameraView: React.FC<Props> = ({
   const [scanMode, setScanMode] = useState<'auto' | 'manual'>('auto');
   const [manualScanPulse, setManualScanPulse] = useState(false);
 
-  // OCR Hook (Pre-warmed singleton worker + Full-Frame 1024px canvas + 450ms sticky memory)
+  // OCR Hook (Pre-warmed singleton worker + Full-Frame 1024px canvas + 3500ms persistent lock-on)
   const {
     isInitializing,
     initStatusText,
@@ -92,7 +89,7 @@ export const CameraView: React.FC<Props> = ({
     purgeItem,
   } = useOCRScanner(ocrLanguage, checklist);
 
-  const stickyTracksRef = useRef<StickyBoxTrack[]>([]);
+  const trackedBoxesRef = useRef<StickyBoxTrack[]>([]);
   const detectedGroupsRef = useRef<DetectedMatchGroup[]>([]);
   const scanDimsRef = useRef<{ w: number; h: number }>({ w: 1024, h: 576 });
   const activeChecklistRef = useRef<ChecklistItem[]>(checklist);
@@ -107,12 +104,13 @@ export const CameraView: React.FC<Props> = ({
         completedIdsRef.current.delete(id);
       }
     }
-    stickyTracksRef.current = stickyTracksRef.current.filter(
+    trackedBoxesRef.current = trackedBoxesRef.current.filter(
       (b) => b.matchedItemId && activeIds.has(b.matchedItemId) && !completedIdsRef.current.has(b.matchedItemId)
     );
   }, [checklist]);
 
-  // Sync latest OCR matched bounding boxes into stickyTracksRef with 450ms sticky memory window
+  // Persistent Lock-On: Match new detections to existing tracked boxes anywhere on screen,
+  // reset missedFrames = 0 & lastSeenTimestamp = now, and hold missed boxes for 3500ms / 6 scans
   useEffect(() => {
     if (!lastScanResult) return;
 
@@ -131,82 +129,76 @@ export const CameraView: React.FC<Props> = ({
       h: lastScanResult.frameHeight,
     };
 
-    const currentTracks = stickyTracksRef.current.filter(
-      (t) => t.matchedItemId && activeIds.has(t.matchedItemId)
+    const currentTracks = trackedBoxesRef.current.filter(
+      (t) => t.matchedItemId && activeIds.has(t.matchedItemId) && !completedIdsRef.current.has(t.matchedItemId)
     );
     const incomingWords = lastScanResult.matchedWords.filter(
-      (w) => w.matchedItemId && activeIds.has(w.matchedItemId)
+      (w) => w.matchedItemId && activeIds.has(w.matchedItemId) && !completedIdsRef.current.has(w.matchedItemId)
     );
-    const updatedTracks: StickyBoxTrack[] = [];
-    const usedPrevIndices = new Set<number>();
-    const maxAssocDist = 140; // in 1024px ocrCanvas coordinate space
 
-    for (let i = 0; i < incomingWords.length; i++) {
-      const m = incomingWords[i];
-      const mCx = (m.bbox.x0 + m.bbox.x1) * 0.5;
-      const mCy = (m.bbox.y0 + m.bbox.y1) * 0.5;
-
-      let bestPrevIdx = -1;
-      let bestDist = maxAssocDist;
-
-      for (let j = 0; j < currentTracks.length; j++) {
-        if (usedPrevIndices.has(j)) continue;
-        const p = currentTracks[j];
-        if (p.matchedItemId !== m.matchedItemId) continue;
-
-        const pCx = (p.bbox.x0 + p.bbox.x1) * 0.5;
-        const pCy = (p.bbox.y0 + p.bbox.y1) * 0.5;
-        const dist = Math.hypot(mCx - pCx, mCy - pCy);
-        if (dist < bestDist) {
-          bestDist = dist;
-          bestPrevIdx = j;
-        }
+    // Group incoming words by target item ID (pick highest confidence if multiple tokens matched same item)
+    const incomingByItemId = new Map<string, MatchedWord>();
+    for (const w of incomingWords) {
+      if (!w.matchedItemId) continue;
+      const existing = incomingByItemId.get(w.matchedItemId);
+      if (!existing || w.confidence > existing.confidence) {
+        incomingByItemId.set(w.matchedItemId, w);
       }
+    }
 
-      if (bestPrevIdx >= 0) {
-        usedPrevIndices.add(bestPrevIdx);
-        const prev = currentTracks[bestPrevIdx];
+    const updatedTracks: StickyBoxTrack[] = [];
+    const matchedPrevIndices = new Set<number>();
+
+    for (const [itemId, m] of incomingByItemId.entries()) {
+      // Match to existing tracked box for this target item anywhere on screen
+      const prevIdx = currentTracks.findIndex(
+        (p, idx) => !matchedPrevIndices.has(idx) && p.matchedItemId === itemId
+      );
+
+      if (prevIdx >= 0) {
+        matchedPrevIndices.add(prevIdx);
+        const prev = currentTracks[prevIdx];
         updatedTracks.push({
           ...prev,
           bbox: m.bbox,
-          lastSeenAt: now,
+          lastSeenTimestamp: now,
+          missedFrames: 0,
         });
       } else {
         updatedTracks.push({
-          key: `${m.id}-${now}-${i}`,
-          matchedItemId: m.matchedItemId,
+          key: `lock-${itemId}`,
+          matchedItemId: itemId,
           bbox: m.bbox,
           x: 0,
           y: 0,
           w: 0,
           h: 0,
-          vx: 0,
-          vy: 0,
-          targetX: 0,
-          targetY: 0,
-          targetW: 0,
-          targetH: 0,
-          lastSeenAt: now,
+          lastSeenTimestamp: now,
+          missedFrames: 0,
           initialized: false,
         });
       }
     }
 
-    // Keep recently seen tracks alive across the 450ms sticky box memory window
+    // Never clear on single-frame OCR drops: keep existing boxes alive for 3500ms OR at least 6 missed OCR scans
     for (let j = 0; j < currentTracks.length; j++) {
-      if (usedPrevIndices.has(j)) continue;
+      if (matchedPrevIndices.has(j)) continue;
       const p = currentTracks[j];
+      const nextMissed = p.missedFrames + 1;
       if (
         p.matchedItemId &&
         activeIds.has(p.matchedItemId) &&
         !completedIdsRef.current.has(p.matchedItemId) &&
-        now - p.lastSeenAt < 450
+        (now - p.lastSeenTimestamp < LOCK_ON_TTL_MS || nextMissed <= MIN_MISSED_SCANS_KEEP)
       ) {
-        updatedTracks.push(p);
+        updatedTracks.push({
+          ...p,
+          missedFrames: nextMissed,
+        });
       }
     }
 
-    stickyTracksRef.current = updatedTracks;
+    trackedBoxesRef.current = updatedTracks;
   }, [lastScanResult]);
 
   // Clean up media tracks immediately to release camera indicator on iOS/Android
@@ -338,13 +330,13 @@ export const CameraView: React.FC<Props> = ({
   const flipCamera = () => {
     setIsFrontCamera((prev) => !prev);
     setIsTorchOn(false);
-    stickyTracksRef.current = [];
+    trackedBoxesRef.current = [];
   };
 
   // Apply Hardware / Digital Zoom (1x, 2x, 3x)
   const applyZoom = async (level: number) => {
     setZoomLevel(level);
-    stickyTracksRef.current = [];
+    trackedBoxesRef.current = [];
     if (!streamRef.current) return;
     const videoTrack = streamRef.current.getVideoTracks()[0];
 
@@ -398,7 +390,7 @@ export const CameraView: React.FC<Props> = ({
     };
   }, [isInitializing, scanSource, matchMode, scanMode]);
 
-  // Sticky 60fps Green Pill Box Renderer (Exact object-fit: cover Coordinate Math)
+  // Persistent Lock-On 60fps Green Pill Box Renderer (3500ms TTL + 6 missed scans + 0.35 lerp + 100% solid opacity)
   useEffect(() => {
     let animId: number;
 
@@ -439,15 +431,16 @@ export const CameraView: React.FC<Props> = ({
                 .map((i) => i.id)
             );
 
-            // Prune expired tracks (> 450ms) and any item marked Done immediately
-            const activeTracks = stickyTracksRef.current.filter(
+            // Keep locked-on boxes alive for 3500ms OR at least 6 missed OCR scans (unless marked Done)
+            const activeTracks = trackedBoxesRef.current.filter(
               (tr) =>
-                now - tr.lastSeenAt < 450 &&
+                (now - tr.lastSeenTimestamp < LOCK_ON_TTL_MS ||
+                  tr.missedFrames <= MIN_MISSED_SCANS_KEEP) &&
                 tr.matchedItemId &&
                 liveActiveIds.has(tr.matchedItemId) &&
                 !completedIdsRef.current.has(tr.matchedItemId)
             );
-            stickyTracksRef.current = activeTracks;
+            trackedBoxesRef.current = activeTracks;
 
             for (let i = 0; i < activeTracks.length; i++) {
               const tr = activeTracks[i];
@@ -465,31 +458,14 @@ export const CameraView: React.FC<Props> = ({
                 tr.y = screenY;
                 tr.w = screenBoxW;
                 tr.h = screenBoxH;
-                tr.targetX = screenX;
-                tr.targetY = screenY;
-                tr.targetW = screenBoxW;
-                tr.targetH = screenBoxH;
                 tr.initialized = true;
               } else {
-                if (tr.targetX !== screenX || tr.targetY !== screenY) {
-                  tr.vx = (screenX - tr.targetX) * 0.25;
-                  tr.vy = (screenY - tr.targetY) * 0.25;
-                  tr.targetX = screenX;
-                  tr.targetY = screenY;
-                  tr.targetW = screenBoxW;
-                  tr.targetH = screenBoxH;
-                } else {
-                  tr.targetX += tr.vx;
-                  tr.targetY += tr.vy;
-                  tr.vx *= 0.82;
-                  tr.vy *= 0.82;
-                }
-
-                const lerp = 0.65;
-                tr.x += (tr.targetX - tr.x) * lerp;
-                tr.y += (tr.targetY - tr.y) * lerp;
-                tr.w += (tr.targetW - tr.w) * lerp;
-                tr.h += (tr.targetH - tr.h) * lerp;
+                // Smoothly glide (lerp factor 0.35 per 60fps animation frame) to updated coordinates
+                const lerp = 0.35;
+                tr.x += (screenX - tr.x) * lerp;
+                tr.y += (screenY - tr.y) * lerp;
+                tr.w += (screenBoxW - tr.w) * lerp;
+                tr.h += (screenBoxH - tr.h) * lerp;
               }
 
               // Tight green pill box geometry
@@ -501,12 +477,9 @@ export const CameraView: React.FC<Props> = ({
               const rh = tr.h + padY * 2;
               const pillRadius = Math.min(8, Math.max(4, rh * 0.32));
 
-              // Smooth fade-out at the end of the 450ms sticky box memory window
-              const ageMs = now - tr.lastSeenAt;
-              const fadeAlpha = ageMs > 360 ? Math.max(0, 1 - (ageMs - 360) / 90) : 1;
-
+              // Solid, unblinking 100% full opacity the entire time the box is locked on
               ctx.save();
-              ctx.globalAlpha = fadeAlpha;
+              ctx.globalAlpha = 1;
               ctx.shadowColor = '#22c55e';
               ctx.shadowBlur = 8;
 
@@ -543,7 +516,7 @@ export const CameraView: React.FC<Props> = ({
     purgeItem(item.id);
 
     // 2. Purge from local tracked boxes & groups refs
-    stickyTracksRef.current = stickyTracksRef.current.filter(
+    trackedBoxesRef.current = trackedBoxesRef.current.filter(
       (b) => b.matchedItemId !== item.id
     );
     detectedGroupsRef.current = detectedGroupsRef.current.filter(
