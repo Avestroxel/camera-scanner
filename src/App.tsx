@@ -3,6 +3,7 @@ import { OcrLanguage, MatchMode, UILanguage, ChecklistItem } from './types';
 import { translations } from './translations';
 import { HomeScreen } from './components/HomeScreen';
 import { CameraView } from './components/CameraView';
+import { prewarmOCRWorker } from './hooks/useOCRScanner';
 import { useOnlineStatus } from './hooks/useOnlineStatus';
 import { WifiOff } from 'lucide-react';
 
@@ -51,6 +52,11 @@ export default function App() {
   const isOnline = useOnlineStatus();
   const t = translations[uiLang] || translations.en;
   const isRtl = uiLang === 'ku' || uiLang === 'ar';
+
+  // Pre-warm the persistent fast OCR worker on the Home Screen to eliminate the 4-second camera startup delay
+  useEffect(() => {
+    prewarmOCRWorker(ocrLanguage);
+  }, [ocrLanguage]);
 
   // Synchronize theme with document.documentElement and localStorage
   useEffect(() => {

@@ -82,39 +82,64 @@ export const CameraView: React.FC<Props> = ({
   const [scanMode, setScanMode] = useState<'auto' | 'manual'>('auto');
   const [manualScanPulse, setManualScanPulse] = useState(false);
 
-  // OCR Hook (Tesseract v5 + PSM 11 + Raw 580px canvas + 4.0.0_fast dual-worker scheduler)
+  // OCR Hook (Pre-warmed singleton worker + Full-Frame 1024px canvas + 450ms sticky memory)
   const {
     isInitializing,
     initStatusText,
-    workerStatus,
     rawTextPreview,
-    isProcessing,
     lastScanResult,
     scanSource,
-  } = useOCRScanner(ocrLanguage);
+    purgeItem,
+  } = useOCRScanner(ocrLanguage, checklist);
 
   const stickyTracksRef = useRef<StickyBoxTrack[]>([]);
   const detectedGroupsRef = useRef<DetectedMatchGroup[]>([]);
-  const scanDimsRef = useRef<{ w: number; h: number }>({ w: 1920, h: 1080 });
+  const scanDimsRef = useRef<{ w: number; h: number }>({ w: 1024, h: 576 });
   const activeChecklistRef = useRef<ChecklistItem[]>(checklist);
   activeChecklistRef.current = checklist;
+  const completedIdsRef = useRef<Set<string>>(new Set());
+
+  // Keep completedIdsRef synced with active checklist (e.g. if batch restarted)
+  useEffect(() => {
+    const activeIds = new Set(checklist.map((i) => i.id));
+    for (const id of Array.from(completedIdsRef.current)) {
+      if (activeIds.has(id)) {
+        completedIdsRef.current.delete(id);
+      }
+    }
+    stickyTracksRef.current = stickyTracksRef.current.filter(
+      (b) => b.matchedItemId && activeIds.has(b.matchedItemId) && !completedIdsRef.current.has(b.matchedItemId)
+    );
+  }, [checklist]);
 
   // Sync latest OCR matched bounding boxes into stickyTracksRef with 450ms sticky memory window
   useEffect(() => {
     if (!lastScanResult) return;
 
     const now = performance.now();
-    detectedGroupsRef.current = lastScanResult.detectedGroups;
+    const activeIds = new Set(
+      activeChecklistRef.current
+        .filter((i) => !completedIdsRef.current.has(i.id))
+        .map((i) => i.id)
+    );
+
+    detectedGroupsRef.current = lastScanResult.detectedGroups.filter((g) =>
+      activeIds.has(g.item.id)
+    );
     scanDimsRef.current = {
       w: lastScanResult.frameWidth,
       h: lastScanResult.frameHeight,
     };
 
-    const currentTracks = stickyTracksRef.current;
-    const incomingWords = lastScanResult.matchedWords;
+    const currentTracks = stickyTracksRef.current.filter(
+      (t) => t.matchedItemId && activeIds.has(t.matchedItemId)
+    );
+    const incomingWords = lastScanResult.matchedWords.filter(
+      (w) => w.matchedItemId && activeIds.has(w.matchedItemId)
+    );
     const updatedTracks: StickyBoxTrack[] = [];
     const usedPrevIndices = new Set<number>();
-    const maxAssocDist = Math.max(180, lastScanResult.frameWidth * 0.14);
+    const maxAssocDist = 140; // in 1024px ocrCanvas coordinate space
 
     for (let i = 0; i < incomingWords.length; i++) {
       const m = incomingWords[i];
@@ -171,8 +196,12 @@ export const CameraView: React.FC<Props> = ({
     for (let j = 0; j < currentTracks.length; j++) {
       if (usedPrevIndices.has(j)) continue;
       const p = currentTracks[j];
-      const stillInQueue = activeChecklistRef.current.some((item) => item.id === p.matchedItemId);
-      if (stillInQueue && now - p.lastSeenAt < 450) {
+      if (
+        p.matchedItemId &&
+        activeIds.has(p.matchedItemId) &&
+        !completedIdsRef.current.has(p.matchedItemId) &&
+        now - p.lastSeenAt < 450
+      ) {
         updatedTracks.push(p);
       }
     }
@@ -331,44 +360,45 @@ export const CameraView: React.FC<Props> = ({
     }
   };
 
-  // Manual scan trigger (runs both Pass 0 Full-Frame HD and Pass 1 1:1 Native Crop on tap)
+  // Manual scan trigger
   const triggerManualScan = useCallback(async () => {
     const video = videoRef.current;
-    const currentItems = activeChecklistRef.current;
+    const currentItems = activeChecklistRef.current.filter(
+      (i) => !completedIdsRef.current.has(i.id)
+    );
     if (video && !isInitializing && currentItems.length > 0) {
       if (video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA && video.videoWidth > 0) {
         setManualScanPulse(true);
         triggerHaptic(40);
-        await Promise.all([
-          scanSource(video, currentItems, matchMode, true, true),
-          scanSource(video, currentItems, matchMode, false, false),
-        ]);
+        await scanSource(video, currentItems, matchMode, true, true);
         setTimeout(() => setManualScanPulse(false), 500);
       }
     }
   }, [isInitializing, matchMode, scanSource]);
 
-  // Dual-Pass High-Resolution 1:1 Pixel OCR Loop (~60ms dispatch alternating Full-Frame & 1:1 Center Crop)
+  // Fast Full-Frame 1024px OCR Loop (~100ms cycle)
   useEffect(() => {
     if (scanMode !== 'auto' || isInitializing) return;
 
     const intervalId = setInterval(() => {
       const video = videoRef.current;
-      const currentItems = activeChecklistRef.current;
+      const currentItems = activeChecklistRef.current.filter(
+        (i) => !completedIdsRef.current.has(i.id)
+      );
 
       if (video && currentItems.length > 0) {
         if (video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA && video.videoWidth > 0) {
           void scanSource(video, currentItems, matchMode, true, true);
         }
       }
-    }, 60);
+    }, 90);
 
     return () => {
       clearInterval(intervalId);
     };
   }, [isInitializing, scanSource, matchMode, scanMode]);
 
-  // Sticky 60fps Green Pill Box Renderer (450ms Sticky Box Memory + Velocity-Assisted Interpolation)
+  // Sticky 60fps Green Pill Box Renderer (Exact object-fit: cover Coordinate Math)
   useEffect(() => {
     let animId: number;
 
@@ -378,80 +408,84 @@ export const CameraView: React.FC<Props> = ({
       const video = videoRef.current;
 
       if (canvas && container && video) {
-        const rect = video.getBoundingClientRect();
-        const screenW = rect.width || container.clientWidth;
-        const screenH = rect.height || container.clientHeight;
-        const dpr = window.devicePixelRatio || 1;
+        const rect = canvas.getBoundingClientRect();
+        const screenW = Math.round(rect.width || canvas.clientWidth || container.clientWidth);
+        const screenH = Math.round(rect.height || canvas.clientHeight || container.clientHeight);
 
-        const targetCanvasW = Math.round(screenW * dpr);
-        const targetCanvasH = Math.round(screenH * dpr);
-
-        if (canvas.width !== targetCanvasW || canvas.height !== targetCanvasH) {
-          canvas.width = targetCanvasW;
-          canvas.height = targetCanvasH;
+        if (canvas.width !== screenW || canvas.height !== screenH) {
+          canvas.width = screenW;
+          canvas.height = screenH;
         }
 
         const ctx = canvas.getContext('2d');
         if (ctx) {
-          ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
           ctx.clearRect(0, 0, screenW, screenH);
 
-          const srcW = scanDimsRef.current.w;
-          const srcH = scanDimsRef.current.h;
+          const ocrW = scanDimsRef.current.w;
+          const ocrH = scanDimsRef.current.h;
 
-          if (srcW > 0 && srcH > 0 && screenW > 0 && screenH > 0) {
+          if (ocrW > 0 && ocrH > 0 && screenW > 0 && screenH > 0) {
             const effectiveZoom = !hardwareZoomAvailable && zoomLevel > 1 ? zoomLevel : 1;
-            const scale = Math.max(screenW / srcW, screenH / srcH) * effectiveZoom;
-            const offsetX = (screenW - srcW * scale) / 2;
-            const offsetY = (screenH - srcH * scale) / 2;
+            const scale = Math.max(screenW / ocrW, screenH / ocrH) * effectiveZoom;
+            const renderedW = ocrW * scale;
+            const renderedH = ocrH * scale;
+            const offsetX = (screenW - renderedW) / 2;
+            const offsetY = (screenH - renderedH) / 2;
 
             const now = performance.now();
-            // Prune expired tracks (> 450ms sticky box memory window)
+            const liveActiveIds = new Set(
+              activeChecklistRef.current
+                .filter((i) => !completedIdsRef.current.has(i.id))
+                .map((i) => i.id)
+            );
+
+            // Prune expired tracks (> 450ms) and any item marked Done immediately
             const activeTracks = stickyTracksRef.current.filter(
-              (tr) => now - tr.lastSeenAt < 450
+              (tr) =>
+                now - tr.lastSeenAt < 450 &&
+                tr.matchedItemId &&
+                liveActiveIds.has(tr.matchedItemId) &&
+                !completedIdsRef.current.has(tr.matchedItemId)
             );
             stickyTracksRef.current = activeTracks;
 
             for (let i = 0; i < activeTracks.length; i++) {
               const tr = activeTracks[i];
-              let tx = tr.bbox.x0 * scale + offsetX;
-              const ty = tr.bbox.y0 * scale + offsetY;
-              const tw = (tr.bbox.x1 - tr.bbox.x0) * scale;
-              const th = (tr.bbox.y1 - tr.bbox.y0) * scale;
+              let screenX = tr.bbox.x0 * scale + offsetX;
+              const screenY = tr.bbox.y0 * scale + offsetY;
+              const screenBoxW = (tr.bbox.x1 - tr.bbox.x0) * scale;
+              const screenBoxH = (tr.bbox.y1 - tr.bbox.y0) * scale;
 
               if (isFrontCamera) {
-                tx = screenW - (tx + tw);
+                screenX = screenW - (screenX + screenBoxW);
               }
 
               if (!tr.initialized) {
-                tr.x = tx;
-                tr.y = ty;
-                tr.w = tw;
-                tr.h = th;
-                tr.targetX = tx;
-                tr.targetY = ty;
-                tr.targetW = tw;
-                tr.targetH = th;
+                tr.x = screenX;
+                tr.y = screenY;
+                tr.w = screenBoxW;
+                tr.h = screenBoxH;
+                tr.targetX = screenX;
+                tr.targetY = screenY;
+                tr.targetW = screenBoxW;
+                tr.targetH = screenBoxH;
                 tr.initialized = true;
               } else {
-                // If target position just updated from OCR, compute instantaneous velocity
-                if (tr.targetX !== tx || tr.targetY !== ty) {
-                  tr.vx = (tx - tr.targetX) * 0.25;
-                  tr.vy = (ty - tr.targetY) * 0.25;
-                  tr.targetX = tx;
-                  tr.targetY = ty;
-                  tr.targetW = tw;
-                  tr.targetH = th;
+                if (tr.targetX !== screenX || tr.targetY !== screenY) {
+                  tr.vx = (screenX - tr.targetX) * 0.25;
+                  tr.vy = (screenY - tr.targetY) * 0.25;
+                  tr.targetX = screenX;
+                  tr.targetY = screenY;
+                  tr.targetW = screenBoxW;
+                  tr.targetH = screenBoxH;
                 } else {
-                  // Apply damped velocity prediction between OCR frames so box glides with camera motion
                   tr.targetX += tr.vx;
                   tr.targetY += tr.vy;
                   tr.vx *= 0.82;
                   tr.vy *= 0.82;
                 }
 
-                // High-speed 60fps sticky spring interpolation
-                const lerp = 0.62;
+                const lerp = 0.65;
                 tr.x += (tr.targetX - tr.x) * lerp;
                 tr.y += (tr.targetY - tr.y) * lerp;
                 tr.w += (tr.targetW - tr.w) * lerp;
@@ -467,7 +501,7 @@ export const CameraView: React.FC<Props> = ({
               const rh = tr.h + padY * 2;
               const pillRadius = Math.min(8, Math.max(4, rh * 0.32));
 
-              // Smooth fade-out only at the end of the 450ms sticky box memory window (360ms -> 450ms)
+              // Smooth fade-out at the end of the 450ms sticky box memory window
               const ageMs = now - tr.lastSeenAt;
               const fadeAlpha = ageMs > 360 ? Math.max(0, 1 - (ageMs - 360) / 90) : 1;
 
@@ -476,13 +510,11 @@ export const CameraView: React.FC<Props> = ({
               ctx.shadowColor = '#22c55e';
               ctx.shadowBlur = 8;
 
-              // Tight translucent green pill fill
               ctx.fillStyle = 'rgba(34, 197, 94, 0.24)';
               ctx.beginPath();
               ctx.roundRect(rx, ry, rw, rh, pillRadius);
               ctx.fill();
 
-              // Crisp bright green pill stroke
               ctx.strokeStyle = '#22c55e';
               ctx.lineWidth = 2.4;
               ctx.stroke();
@@ -502,19 +534,27 @@ export const CameraView: React.FC<Props> = ({
     };
   }, [isFrontCamera, hardwareZoomAvailable, zoomLevel]);
 
-  // Handle "تەواو" (Done) button action on a found item
+  // Handle "✓ Done" button action on a found item — immediately purges OCR memory & tracked boxes
   const handleMarkItemDone = (item: ChecklistItem) => {
     triggerHaptic(60);
 
+    // 1. Tombstone immediately so neither the 60fps canvas nor in-flight OCR jobs can resurrect it
+    completedIdsRef.current.add(item.id);
+    purgeItem(item.id);
+
+    // 2. Purge from local tracked boxes & groups refs
+    stickyTracksRef.current = stickyTracksRef.current.filter(
+      (b) => b.matchedItemId !== item.id
+    );
+    detectedGroupsRef.current = detectedGroupsRef.current.filter(
+      (g) => g.item.id !== item.id
+    );
+
+    // 3. Show completion toast & update parent state
     setSuccessToast(t.completedToast(item.text));
     setTimeout(() => {
       setSuccessToast(null);
     }, 1800);
-
-    stickyTracksRef.current = stickyTracksRef.current.filter(
-      (b) => b.matchedItemId !== item.id
-    );
-    detectedGroupsRef.current = detectedGroupsRef.current.filter((g) => g.item.id !== item.id);
 
     onCompleteItem(item);
   };
@@ -526,7 +566,10 @@ export const CameraView: React.FC<Props> = ({
 
   const totalCount = Math.max(initialTotalCount, checklist.length + completedItems.length);
   const remainingCount = checklist.length;
-  const detectedGroups = lastScanResult?.detectedGroups || [];
+  const activeIdSet = new Set(checklist.map((i) => i.id));
+  const detectedGroups = (lastScanResult?.detectedGroups || []).filter(
+    (g) => activeIdSet.has(g.item.id) && !completedIdsRef.current.has(g.item.id)
+  );
   const isAllCompleted = checklist.length === 0 && totalCount > 0;
 
   // If all items completed, stop camera tracks immediately

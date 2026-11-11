@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
-import { createWorker, createScheduler, Scheduler, Worker, PSM } from 'tesseract.js';
+import { createWorker, Worker, PSM } from 'tesseract.js';
 import { OcrLanguage, MatchMode, MatchedWord, ScanResult, ChecklistItem, DetectedMatchGroup } from '../types';
 import { normalizeText } from '../utils/textMatcher';
 import { triggerHaptic, playMatchChime } from '../utils/audioAlert';
@@ -24,15 +24,102 @@ interface StickyRecentMatch {
 }
 
 const FAST_LANG_CDN = 'https://tessdata.projectnaptha.com/4.0.0_fast';
-const PARALLEL_WORKERS = 2;
-
-// Pass 0: High-resolution full-frame overview width (2.2x sharper than 580px)
-const FULL_PASS_MAX_WIDTH = 1280;
-// Pass 1: 1:1 Native sensor pixel crop dimensions (ZERO downscaling for distant/small text)
-const NATIVE_CROP_MAX_W = 960;
-const NATIVE_CROP_MAX_H = 680;
-// 450ms sticky box memory window across dual passes
+export const OCR_CANVAS_WIDTH = 1024;
 const STICKY_MEMORY_MS = 450;
+
+// Module-level singleton worker cache so opening the camera has 0ms initialization delay
+let singletonWorker: Worker | null = null;
+let singletonLang: OcrLanguage | null = null;
+let singletonInitPromise: Promise<Worker> | null = null;
+
+async function getOrCreateSingletonWorker(
+  lang: OcrLanguage,
+  onProgress?: (progress: number, statusText: string) => void
+): Promise<Worker> {
+  if (singletonWorker && singletonLang === lang) {
+    onProgress?.(100, 'Ready / Scanning...');
+    return singletonWorker;
+  }
+
+  if (singletonInitPromise && singletonLang === lang) {
+    return singletonInitPromise;
+  }
+
+  // If language changed, terminate old worker first
+  if (singletonWorker && singletonLang !== lang) {
+    const oldWorker = singletonWorker;
+    singletonWorker = null;
+    singletonLang = null;
+    singletonInitPromise = null;
+    try {
+      await oldWorker.terminate();
+    } catch {
+      // ignore
+    }
+  }
+
+  singletonLang = lang;
+  singletonInitPromise = (async () => {
+    onProgress?.(20, `Loading Fast ${lang}...`);
+    let worker: Worker;
+    try {
+      worker = await createWorker(lang, 1, {
+        langPath: FAST_LANG_CDN,
+        logger: (m) => {
+          if (m.status) {
+            if (m.status === 'loading tesseract core') {
+              onProgress?.(35, 'Loading Fast Core...');
+            } else if (m.status === 'initializing tesseract') {
+              onProgress?.(65, 'Initializing OCR...');
+            } else if (m.status.includes('loading') || m.status.includes('traineddata')) {
+              const p = Math.round((m.progress || 0) * 30) + 65;
+              onProgress?.(
+                Math.min(98, p),
+                `Fast Model ${lang} (${Math.round((m.progress || 0) * 100)}%)...`
+              );
+            }
+          }
+        },
+      });
+    } catch {
+      worker = await createWorker(lang, 1);
+    }
+
+    await worker.setParameters({
+      tessedit_pageseg_mode: PSM.SPARSE_TEXT, // '11' - Sparse text - ultra fast
+      load_system_dawg: '0',
+      load_freq_dawg: '0',
+      tessjs_create_hocr: '0',
+      tessjs_create_tsv: '0',
+      tessjs_create_box: '0',
+      tessjs_create_unlv: '0',
+      tessjs_create_osd: '0',
+    });
+
+    singletonWorker = worker;
+    onProgress?.(100, 'Ready / Scanning...');
+    return worker;
+  })();
+
+  try {
+    return await singletonInitPromise;
+  } catch (err) {
+    singletonWorker = null;
+    singletonLang = null;
+    singletonInitPromise = null;
+    throw err;
+  }
+}
+
+/**
+ * Pre-warms the persistent fast OCR worker while the user is still on the Home Screen
+ * so opening the camera starts scanning immediately with zero wait.
+ */
+export function prewarmOCRWorker(lang: OcrLanguage): void {
+  void getOrCreateSingletonWorker(lang).catch(() => {
+    // handled when scanner mounts
+  });
+}
 
 /**
  * Foolproof cleaner for English, Kurdish, and Arabic text/numbers
@@ -46,150 +133,170 @@ function clean(str: string): string {
 }
 
 /**
- * Tightens a word's horizontal bounding box when the OCR token contains extra characters
- * around the target query (e.g. "Price:50" or "after," when searching "50" or "after").
+ * Exact character-proportional horizontal bounding box slicer.
+ * If the matched word is inside a longer token (e.g. "netlify" inside "camscanner07.netlify.app"),
+ * slices x0 and x1 proportionally by character index BEFORE screen scaling.
  */
-function tightenWordBbox(
+function sliceExactTokenBbox(
   bbox: { x0: number; y0: number; x1: number; y1: number },
   rawWordText: string,
   targetText: string
 ): { x0: number; y0: number; x1: number; y1: number } {
-  const cWord = clean(rawWordText);
-  const cTarget = clean(targetText);
-  if (
-    cWord.length > cTarget.length + 1 &&
-    cTarget.length >= 2 &&
-    cWord.includes(cTarget)
-  ) {
-    const idx = cWord.indexOf(cTarget);
-    if (idx >= 0) {
-      const w = bbox.x1 - bbox.x0;
-      const startRatio = idx / cWord.length;
-      const endRatio = (idx + cTarget.length) / cWord.length;
-      return {
-        x0: bbox.x0 + w * startRatio,
-        y0: bbox.y0,
-        x1: bbox.x0 + w * endRatio,
-        y1: bbox.y1,
-      };
-    }
+  const wordStr = rawWordText.trim();
+  const targetStr = targetText.trim();
+  if (!wordStr || !targetStr) return bbox;
+
+  const fullTokenLen = Math.max(1, wordStr.length);
+  const lowerWord = wordStr.toLowerCase();
+  const lowerTarget = targetStr.toLowerCase();
+
+  let matchStartIdx = lowerWord.indexOf(lowerTarget);
+  let matchLen = targetStr.length;
+  let denomLen = fullTokenLen;
+
+  if (matchStartIdx < 0) {
+    const normWord = normalizeText(wordStr).toLowerCase();
+    const normTarget = normalizeText(targetStr).toLowerCase();
+    matchStartIdx = normWord.indexOf(normTarget);
+    matchLen = normTarget.length;
+    denomLen = Math.max(1, normWord.length);
   }
-  return bbox;
+
+  const charStartRatio = matchStartIdx >= 0 ? matchStartIdx / denomLen : 0;
+  const charWidthRatio =
+    matchStartIdx >= 0 ? Math.min(1 - charStartRatio, matchLen / denomLen) : 1;
+
+  const rawWordW = bbox.x1 - bbox.x0;
+  const exactX0 = bbox.x0 + rawWordW * charStartRatio;
+  const exactW = rawWordW * charWidthRatio;
+
+  return {
+    x0: exactX0,
+    y0: bbox.y0,
+    x1: exactX0 + exactW,
+    y1: bbox.y1,
+  };
 }
 
-export function useOCRScanner(selectedLang: OcrLanguage) {
-  const [isInitializing, setIsInitializing] = useState(true);
-  const [initProgress, setInitProgress] = useState(0);
-  const [initStatusText, setInitStatusText] = useState('Loading Fast HD OCR Engine...');
-  const [workerStatus, setWorkerStatus] = useState<'initializing' | 'ready' | 'error'>('initializing');
+export function useOCRScanner(selectedLang: OcrLanguage, liveChecklist: ChecklistItem[] = []) {
+  const alreadyReady = singletonWorker !== null && singletonLang === selectedLang;
+  const [isInitializing, setIsInitializing] = useState(!alreadyReady);
+  const [initProgress, setInitProgress] = useState(alreadyReady ? 100 : 15);
+  const [initStatusText, setInitStatusText] = useState(
+    alreadyReady ? 'Ready / Scanning...' : 'Loading Fast OCR Engine...'
+  );
+  const [workerStatus, setWorkerStatus] = useState<'initializing' | 'ready' | 'error'>(
+    alreadyReady ? 'ready' : 'initializing'
+  );
   const [rawTextPreview, setRawTextPreview] = useState<string>('');
   const [isProcessing, setIsProcessing] = useState(false);
   const [lastScanResult, setLastScanResult] = useState<ScanResult | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  const schedulerRef = useRef<Scheduler | null>(null);
-  const workersRef = useRef<Worker[]>([]);
-  // Dual offscreen canvas pool (Slot 0: Full-Frame HD Pass, Slot 1: 1:1 Native Pixel Distant Pass)
-  const canvasPoolRef = useRef<[HTMLCanvasElement | null, HTMLCanvasElement | null]>([null, null]);
-  const passToggleRef = useRef<number>(0);
-  const activeJobsRef = useRef<number>(0);
+  const workerRef = useRef<Worker | null>(alreadyReady ? singletonWorker : null);
+  const ocrCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const isBusyRef = useRef<boolean>(false);
   const previousMatchedItemIdsRef = useRef<Set<string>>(new Set());
-  // 450ms sticky match memory so Pass 0 (Full Frame) and Pass 1 (1:1 Center Crop) fuse seamlessly
   const recentMatchesRef = useRef<StickyRecentMatch[]>([]);
 
-  // Initialize Dual-Worker Tesseract v5 Scheduler with 4.0.0_fast + PSM 11 + DAWG disabled
+  // Live checklist ref & completed tombstone set so in-flight OCR scans NEVER resurrect a "Done" item
+  const liveChecklistRef = useRef<ChecklistItem[]>(liveChecklist);
+  liveChecklistRef.current = liveChecklist;
+  const completedTombstonesRef = useRef<Set<string>>(new Set());
+
+  // Keep tombstones synced if checklist resets
+  useEffect(() => {
+    const currentActiveIds = new Set(liveChecklist.map((i) => i.id));
+    // If an item is back in active checklist (e.g. batch restart), remove from tombstones
+    for (const id of Array.from(completedTombstonesRef.current)) {
+      if (currentActiveIds.has(id)) {
+        completedTombstonesRef.current.delete(id);
+      }
+    }
+    // Also immediately prune any removed/completed items from sticky memory & lastScanResult
+    recentMatchesRef.current = recentMatchesRef.current.filter((m) =>
+      currentActiveIds.has(m.item.id)
+    );
+    setLastScanResult((prev) => {
+      if (!prev) return null;
+      const filteredWords = prev.matchedWords.filter(
+        (w) => w.matchedItemId && currentActiveIds.has(w.matchedItemId)
+      );
+      const filteredGroups = prev.detectedGroups.filter((g) =>
+        currentActiveIds.has(g.item.id)
+      );
+      if (
+        filteredWords.length === prev.matchedWords.length &&
+        filteredGroups.length === prev.detectedGroups.length
+      ) {
+        return prev;
+      }
+      return {
+        ...prev,
+        allWords: filteredWords,
+        matchedWords: filteredWords,
+        detectedGroups: filteredGroups,
+      };
+    });
+  }, [liveChecklist]);
+
+  // Immediately purge a completed item from all OCR memory and state
+  const purgeItem = useCallback((itemId: string) => {
+    completedTombstonesRef.current.add(itemId);
+    previousMatchedItemIdsRef.current.delete(itemId);
+    recentMatchesRef.current = recentMatchesRef.current.filter(
+      (entry) => entry.item.id !== itemId && entry.word.matchedItemId !== itemId
+    );
+    setLastScanResult((prev) => {
+      if (!prev) return null;
+      const filteredWords = prev.matchedWords.filter((w) => w.matchedItemId !== itemId);
+      const filteredGroups = prev.detectedGroups.filter((g) => g.item.id !== itemId);
+      return {
+        ...prev,
+        allWords: filteredWords,
+        matchedWords: filteredWords,
+        detectedGroups: filteredGroups,
+      };
+    });
+  }, []);
+
+  // Attach to or initialize the singleton worker
   useEffect(() => {
     let isCancelled = false;
 
-    async function setupFastScheduler() {
-      setIsInitializing(true);
-      setWorkerStatus('initializing');
-      setInitProgress(15);
-      setInitStatusText(`Loading Fast HD ${selectedLang}...`);
-
-      if (schedulerRef.current) {
-        try {
-          await schedulerRef.current.terminate();
-        } catch {
-          // ignore
-        }
-        schedulerRef.current = null;
-        workersRef.current = [];
-      }
-
-      try {
-        const scheduler = createScheduler();
-
-        const createFastWorker = async (workerIdx: number): Promise<Worker> => {
-          let worker: Worker;
-          try {
-            worker = await createWorker(selectedLang, 1, {
-              langPath: FAST_LANG_CDN,
-              logger:
-                workerIdx === 0
-                  ? (m) => {
-                      if (!isCancelled && m.status) {
-                        if (m.status === 'loading tesseract core') {
-                          setInitProgress(30);
-                          setInitStatusText('Loading Fast Core...');
-                        } else if (m.status === 'initializing tesseract') {
-                          setInitProgress(60);
-                          setInitStatusText('Initializing Dual HD Workers...');
-                        } else if (m.status.includes('loading') || m.status.includes('traineddata')) {
-                          const p = Math.round((m.progress || 0) * 35) + 60;
-                          setInitProgress(Math.min(98, p));
-                          setInitStatusText(
-                            `Fast Model ${selectedLang} (${Math.round((m.progress || 0) * 100)}%)...`
-                          );
-                        }
-                      }
-                    }
-                  : undefined,
-            });
-          } catch {
-            worker = await createWorker(selectedLang, 1);
-          }
-
-          // PSM 11 (Sparse text - ultra fast) + 300 DPI hint for small distant text + disable DAWGs
-          await worker.setParameters({
-            tessedit_pageseg_mode: PSM.SPARSE_TEXT,
-            user_defined_dpi: '300',
-            load_system_dawg: '0',
-            load_freq_dawg: '0',
-            tessjs_create_hocr: '0',
-            tessjs_create_tsv: '0',
-            tessjs_create_box: '0',
-            tessjs_create_unlv: '0',
-            tessjs_create_osd: '0',
-          });
-
-          return worker;
-        };
-
-        const createdWorkers = await Promise.all(
-          Array.from({ length: PARALLEL_WORKERS }, (_, idx) => createFastWorker(idx))
-        );
-
-        if (isCancelled) {
-          await Promise.all(createdWorkers.map((w) => w.terminate()));
-          return;
-        }
-
-        for (const w of createdWorkers) {
-          scheduler.addWorker(w);
-        }
-
-        schedulerRef.current = scheduler;
-        workersRef.current = createdWorkers;
-        activeJobsRef.current = 0;
+    async function attachWorker() {
+      if (singletonWorker && singletonLang === selectedLang) {
+        workerRef.current = singletonWorker;
         setIsInitializing(false);
         setWorkerStatus('ready');
         setInitProgress(100);
-        setInitStatusText('Ready / HD 1:1 Scanning...');
+        setInitStatusText('Ready / Scanning...');
         setError(null);
+        return;
+      }
+
+      setIsInitializing(true);
+      setWorkerStatus('initializing');
+
+      try {
+        const w = await getOrCreateSingletonWorker(selectedLang, (prog, text) => {
+          if (!isCancelled) {
+            setInitProgress(prog);
+            setInitStatusText(text);
+          }
+        });
+
+        if (!isCancelled) {
+          workerRef.current = w;
+          setIsInitializing(false);
+          setWorkerStatus('ready');
+          setInitProgress(100);
+          setInitStatusText('Ready / Scanning...');
+          setError(null);
+        }
       } catch (err) {
         if (!isCancelled) {
-          console.error('OCR scheduler init error:', err);
+          console.error('OCR worker init error:', err);
           const errorMsg = err instanceof Error ? err.message : String(err);
           setError(`Worker Error: ${errorMsg}`);
           setWorkerStatus('error');
@@ -199,38 +306,32 @@ export function useOCRScanner(selectedLang: OcrLanguage) {
       }
     }
 
-    setupFastScheduler();
+    attachWorker();
 
     return () => {
       isCancelled = true;
-      if (schedulerRef.current) {
-        schedulerRef.current.terminate();
-        schedulerRef.current = null;
-        workersRef.current = [];
-      }
     };
   }, [selectedLang]);
 
   /**
-   * Dual-Pass High-Resolution 1:1 Pixel Pipeline:
-   * - Pass 0 (Full-Frame HD): Captures the entire frame up to 1280px wide to catch text anywhere on screen.
-   * - Pass 1 (1:1 Native Pixel Center Crop): Captures the central region at true 1:1 sensor resolution
-   *   with ZERO downscaling so small or distant text is read cleanly without zooming in.
-   * All bounding boxes are transformed back into unified native video coordinates (videoW x videoH).
+   * Full-Frame 1024px OCR Pipeline (Zero Cropping = 100% Exact Coordinate Alignment):
+   * Always draws the FULL <video> frame (0, 0, ocrW, ocrH) where ocrW = 1024 and
+   * ocrH = Math.round(1024 * (video.videoHeight / video.videoWidth)).
    */
   const scanSource = useCallback(
     async (
       source: HTMLVideoElement | HTMLCanvasElement | HTMLImageElement,
-      targetItems: ChecklistItem[],
+      _targetItems: ChecklistItem[],
       _mode: MatchMode,
       enableHaptics = true,
       enableSound = true
     ): Promise<ScanResult | null> => {
+      const worker = workerRef.current;
       if (
-        !schedulerRef.current ||
-        activeJobsRef.current >= PARALLEL_WORKERS ||
+        !worker ||
+        isBusyRef.current ||
         isInitializing ||
-        targetItems.length === 0
+        liveChecklistRef.current.length === 0
       ) {
         return null;
       }
@@ -258,86 +359,61 @@ export function useOCRScanner(selectedLang: OcrLanguage) {
         return null;
       }
 
-      activeJobsRef.current += 1;
+      isBusyRef.current = true;
       setIsProcessing(true);
       const startTime = performance.now();
 
       try {
-        // Alternate between Pass 0 (Full-Frame High-Res) and Pass 1 (1:1 Native Pixel Center Crop)
-        const passType = passToggleRef.current % 2;
-        passToggleRef.current = (passToggleRef.current + 1) % 2;
+        // Always draw the FULL <video> frame onto offscreen ocrCanvas (width = 1024, proportional height)
+        const ocrW = OCR_CANVAS_WIDTH;
+        const ocrH = Math.max(1, Math.round(OCR_CANVAS_WIDTH * (videoH / videoW)));
 
-        if (!canvasPoolRef.current[passType]) {
-          canvasPoolRef.current[passType] = document.createElement('canvas');
+        if (!ocrCanvasRef.current) {
+          ocrCanvasRef.current = document.createElement('canvas');
         }
-        const ocrCanvas = canvasPoolRef.current[passType]!;
-
-        // Coordinate mapping parameters from ocrCanvas -> native video (videoW x videoH)
-        let cropOffsetX = 0;
-        let cropOffsetY = 0;
-        let scaleToVideoX = 1;
-        let scaleToVideoY = 1;
-
-        if (passType === 1 && (videoW > NATIVE_CROP_MAX_W || videoH > NATIVE_CROP_MAX_H)) {
-          // PASS 1: 1:1 Native Sensor Pixel Center Crop (ZERO downscaling for distant small text)
-          const cropW = Math.min(videoW, NATIVE_CROP_MAX_W);
-          const cropH = Math.min(videoH, NATIVE_CROP_MAX_H);
-          cropOffsetX = Math.round((videoW - cropW) * 0.5);
-          cropOffsetY = Math.round((videoH - cropH) * 0.5);
-
-          if (ocrCanvas.width !== cropW || ocrCanvas.height !== cropH) {
-            ocrCanvas.width = cropW;
-            ocrCanvas.height = cropH;
-          }
-
-          const ocrCtx = ocrCanvas.getContext('2d', { alpha: false });
-          if (!ocrCtx) return null;
-
-          ocrCtx.imageSmoothingEnabled = false;
-          ocrCtx.drawImage(source, cropOffsetX, cropOffsetY, cropW, cropH, 0, 0, cropW, cropH);
-          scaleToVideoX = 1;
-          scaleToVideoY = 1;
-        } else {
-          // PASS 0: High-Resolution Full-Frame Pass (up to 1280px wide)
-          const ocrW = Math.min(videoW, FULL_PASS_MAX_WIDTH);
-          const ocrH = Math.max(1, Math.round((videoH / videoW) * ocrW));
-
-          if (ocrCanvas.width !== ocrW || ocrCanvas.height !== ocrH) {
-            ocrCanvas.width = ocrW;
-            ocrCanvas.height = ocrH;
-          }
-
-          const ocrCtx = ocrCanvas.getContext('2d', { alpha: false });
-          if (!ocrCtx) return null;
-
-          ocrCtx.imageSmoothingEnabled = true;
-          ocrCtx.imageSmoothingQuality = 'high';
-          ocrCtx.drawImage(source, 0, 0, ocrW, ocrH);
-
-          cropOffsetX = 0;
-          cropOffsetY = 0;
-          scaleToVideoX = videoW / ocrW;
-          scaleToVideoY = videoH / ocrH;
+        const ocrCanvas = ocrCanvasRef.current;
+        if (ocrCanvas.width !== ocrW || ocrCanvas.height !== ocrH) {
+          ocrCanvas.width = ocrW;
+          ocrCanvas.height = ocrH;
         }
 
-        const ret = await schedulerRef.current.addJob('recognize', ocrCanvas);
+        const ocrCtx = ocrCanvas.getContext('2d', { alpha: false });
+        if (!ocrCtx) {
+          return null;
+        }
+
+        // Draw FULL <video> frame directly — NO sub-region cropping, NO CSS/SVG filters
+        ocrCtx.drawImage(source, 0, 0, ocrW, ocrH);
+
+        const ret = await worker.recognize(ocrCanvas);
         const data = ret.data;
         const rawFullText = (data.text || '').trim();
 
-        if (rawFullText) {
-          const sanitizedPreview = rawFullText.replace(/\s+/g, ' ').slice(0, 60);
-          setRawTextPreview(sanitizedPreview);
+        const sanitizedPreview = rawFullText.replace(/\s+/g, ' ').slice(0, 60);
+        setRawTextPreview(sanitizedPreview);
+
+        // Read the LIVE active checklist AFTER recognize() resolves so items marked "Done"
+        // while this frame was being processed are never matched or resurrected!
+        const freshTargetItems = liveChecklistRef.current.filter(
+          (item) => !item.isCompleted && !completedTombstonesRef.current.has(item.id)
+        );
+
+        if (freshTargetItems.length === 0) {
+          recentMatchesRef.current = [];
+          const emptyResult: ScanResult = {
+            allWords: [],
+            matchedWords: [],
+            detectedGroups: [],
+            fullText: rawFullText,
+            processingTimeMs: Math.round(performance.now() - startTime),
+            frameWidth: ocrW,
+            frameHeight: ocrH,
+          };
+          setLastScanResult(emptyResult);
+          return emptyResult;
         }
 
-        // Helper to map ocrCanvas bbox -> native videoW x videoH coordinate space
-        const toVideoBbox = (b: { x0: number; y0: number; x1: number; y1: number }) => ({
-          x0: b.x0 * scaleToVideoX + cropOffsetX,
-          y0: b.y0 * scaleToVideoY + cropOffsetY,
-          x1: b.x1 * scaleToVideoX + cropOffsetX,
-          y1: b.y1 * scaleToVideoY + cropOffsetY,
-        });
-
-        // Extract words and lines mapped to native videoW x videoH coordinates
+        // Extract words and lines in 1024px ocrCanvas space
         const wordsList: RawWordItem[] = [];
         const linesList: RawLineItem[] = [];
 
@@ -348,7 +424,7 @@ export function useOCRScanner(selectedLang: OcrLanguage) {
               wordsList.push({
                 text: w.text.trim(),
                 confidence: Math.round(w.confidence || 85),
-                bbox: toVideoBbox(w.bbox),
+                bbox: w.bbox,
               });
             }
           }
@@ -363,7 +439,7 @@ export function useOCRScanner(selectedLang: OcrLanguage) {
                   const item: RawWordItem = {
                     text: w.text.trim(),
                     confidence: Math.round(w.confidence || 85),
-                    bbox: toVideoBbox(w.bbox),
+                    bbox: w.bbox,
                   };
                   lineWords.push(item);
                   if (wordsList.length === 0) {
@@ -376,7 +452,7 @@ export function useOCRScanner(selectedLang: OcrLanguage) {
               linesList.push({
                 text: line.text.trim(),
                 confidence: Math.round(line.confidence || 85),
-                bbox: toVideoBbox(line.bbox),
+                bbox: line.bbox,
                 words: lineWords,
               });
             }
@@ -396,7 +472,7 @@ export function useOCRScanner(selectedLang: OcrLanguage) {
                           const item: RawWordItem = {
                             text: w.text.trim(),
                             confidence: Math.round(w.confidence || 85),
-                            bbox: toVideoBbox(w.bbox),
+                            bbox: w.bbox,
                           };
                           lineWords.push(item);
                           wordsList.push(item);
@@ -407,7 +483,7 @@ export function useOCRScanner(selectedLang: OcrLanguage) {
                       linesList.push({
                         text: l.text.trim(),
                         confidence: Math.round(l.confidence || 85),
-                        bbox: toVideoBbox(l.bbox),
+                        bbox: l.bbox,
                         words: lineWords,
                       });
                     }
@@ -418,15 +494,16 @@ export function useOCRScanner(selectedLang: OcrLanguage) {
           }
         }
 
-        const currentPassWords: MatchedWord[] = [];
+        const currentFrameWords: MatchedWord[] = [];
 
-        for (const targetItem of targetItems) {
+        for (const targetItem of freshTargetItems) {
+          if (completedTombstonesRef.current.has(targetItem.id)) continue;
           const cleanTarget = clean(targetItem.text);
           if (!cleanTarget) continue;
 
           let matchedInWords = false;
 
-          // 1. Word-level match with tight sub-word proportional bbox slicing
+          // 1. Word-level match with exact character-index proportional sub-slicing
           for (let i = 0; i < wordsList.length; i++) {
             const w = wordsList[i];
             const cleanWord = clean(w.text);
@@ -440,25 +517,25 @@ export function useOCRScanner(selectedLang: OcrLanguage) {
 
             if (isDirectMatch || isReverseMatch) {
               matchedInWords = true;
-              const tightBbox = tightenWordBbox(w.bbox, w.text, targetItem.text);
+              const exactBbox = sliceExactTokenBbox(w.bbox, w.text, targetItem.text);
               const matchObj: MatchedWord = {
-                id: `w-${targetItem.id}-${passType}-${i}`,
+                id: `w-${targetItem.id}-${i}`,
                 text: w.text,
                 normalizedText: cleanWord,
                 confidence: w.confidence,
-                bbox: tightBbox,
+                bbox: exactBbox,
                 isMatch: true,
                 score: isDirectMatch ? 1.0 : 0.9,
                 matchedItemId: targetItem.id,
                 matchedItemText: targetItem.text,
               };
 
-              currentPassWords.push(matchObj);
+              currentFrameWords.push(matchObj);
             }
           }
 
-          // 2. Multi-word line fallback (uses tight union of matching words inside the line)
-          if (!matchedInWords) {
+          // 2. Multi-word phrase fallback (tight union of matching words inside the line)
+          if (!matchedInWords && targetItem.text.trim().includes(' ')) {
             for (let lIdx = 0; lIdx < linesList.length; lIdx++) {
               const line = linesList[lIdx];
               const cleanLine = clean(line.text);
@@ -474,59 +551,57 @@ export function useOCRScanner(selectedLang: OcrLanguage) {
                 const cw = clean(lw.text);
                 return (
                   cw.length > 0 &&
-                  (cleanTarget.includes(cw) ||
-                    cw.includes(cleanTarget) ||
-                    targetParts.some((tp) => cw.includes(tp) || tp.includes(cw)))
+                  targetParts.some((tp) => cw.includes(tp) || tp.includes(cw))
                 );
               });
 
-              const bboxToUse =
-                matchingLineWords.length > 0
-                  ? {
-                      x0: Math.min(...matchingLineWords.map((lw) => lw.bbox.x0)),
-                      y0: Math.min(...matchingLineWords.map((lw) => lw.bbox.y0)),
-                      x1: Math.max(...matchingLineWords.map((lw) => lw.bbox.x1)),
-                      y1: Math.max(...matchingLineWords.map((lw) => lw.bbox.y1)),
-                    }
-                  : line.bbox;
+              if (matchingLineWords.length > 0) {
+                const bboxToUse = {
+                  x0: Math.min(...matchingLineWords.map((lw) => lw.bbox.x0)),
+                  y0: Math.min(...matchingLineWords.map((lw) => lw.bbox.y0)),
+                  x1: Math.max(...matchingLineWords.map((lw) => lw.bbox.x1)),
+                  y1: Math.max(...matchingLineWords.map((lw) => lw.bbox.y1)),
+                };
 
-              const matchObj: MatchedWord = {
-                id: `l-${targetItem.id}-${passType}-${lIdx}`,
-                text: line.text,
-                normalizedText: cleanLine,
-                confidence: line.confidence,
-                bbox: bboxToUse,
-                isMatch: true,
-                score: 0.95,
-                matchedItemId: targetItem.id,
-                matchedItemText: targetItem.text,
-              };
+                const matchObj: MatchedWord = {
+                  id: `l-${targetItem.id}-${lIdx}`,
+                  text: line.text,
+                  normalizedText: cleanLine,
+                  confidence: line.confidence,
+                  bbox: bboxToUse,
+                  isMatch: true,
+                  score: 0.95,
+                  matchedItemId: targetItem.id,
+                  matchedItemText: targetItem.text,
+                };
 
-              currentPassWords.push(matchObj);
+                currentFrameWords.push(matchObj);
+              }
             }
           }
         }
 
-        // Fuse current pass detections with 450ms sticky match memory across Pass 0 and Pass 1
+        // Fuse with 450ms sticky memory (strictly excluding any completed tombstones)
         const now = performance.now();
-        const activeTargetIds = new Set(targetItems.map((t) => t.id));
+        const activeTargetIds = new Set(freshTargetItems.map((t) => t.id));
         const survivingMemory = recentMatchesRef.current.filter(
           (entry) =>
             now - entry.timestamp < STICKY_MEMORY_MS &&
-            activeTargetIds.has(entry.item.id)
+            activeTargetIds.has(entry.item.id) &&
+            !completedTombstonesRef.current.has(entry.item.id)
         );
 
-        const targetById = new Map(targetItems.map((t) => [t.id, t]));
-        const dedupRadius = Math.max(90, videoW * 0.06);
+        const targetById = new Map(freshTargetItems.map((t) => [t.id, t]));
+        const dedupRadius = 110; // in 1024px ocrCanvas space
 
-        for (const w of currentPassWords) {
-          const item = w.matchedItemId ? targetById.get(w.matchedItemId) : undefined;
+        for (const w of currentFrameWords) {
+          if (!w.matchedItemId || completedTombstonesRef.current.has(w.matchedItemId)) continue;
+          const item = targetById.get(w.matchedItemId);
           if (!item) continue;
 
           const wCx = (w.bbox.x0 + w.bbox.x1) * 0.5;
           const wCy = (w.bbox.y0 + w.bbox.y1) * 0.5;
 
-          // Replace existing memory entry if it represents the same physical word on screen
           const existingIdx = survivingMemory.findIndex((m) => {
             if (m.item.id !== item.id) return false;
             const mCx = (m.word.bbox.x0 + m.word.bbox.x1) * 0.5;
@@ -553,7 +628,8 @@ export function useOCRScanner(selectedLang: OcrLanguage) {
         }
 
         const detectedGroups: DetectedMatchGroup[] = [];
-        for (const target of targetItems) {
+        for (const target of freshTargetItems) {
+          if (completedTombstonesRef.current.has(target.id)) continue;
           const words = itemToMatchesMap.get(target.id);
           if (words && words.length > 0) {
             const primaryWord = words.reduce(
@@ -575,9 +651,8 @@ export function useOCRScanner(selectedLang: OcrLanguage) {
           detectedGroups,
           fullText: rawFullText,
           processingTimeMs: Math.round(endTime - startTime),
-          // Always report native videoW x videoH so screen overlay mapping is 100% unified
-          frameWidth: videoW,
-          frameHeight: videoH,
+          frameWidth: ocrW,
+          frameHeight: ocrH,
         };
 
         setLastScanResult(result);
@@ -602,10 +677,8 @@ export function useOCRScanner(selectedLang: OcrLanguage) {
         console.warn('OCR scan error:', err);
         return null;
       } finally {
-        activeJobsRef.current = Math.max(0, activeJobsRef.current - 1);
-        if (activeJobsRef.current === 0) {
-          setIsProcessing(false);
-        }
+        isBusyRef.current = false;
+        setIsProcessing(false);
       }
     },
     [isInitializing]
@@ -621,5 +694,6 @@ export function useOCRScanner(selectedLang: OcrLanguage) {
     lastScanResult,
     error,
     scanSource,
+    purgeItem,
   };
 }
