@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
-import { createWorker, createScheduler, Scheduler, Worker, PSM } from 'tesseract.js';
+import { createWorker, Worker, PSM } from 'tesseract.js';
 import { OcrLanguage, MatchMode, MatchedWord, ScanResult, ChecklistItem, DetectedMatchGroup } from '../types';
 import {
   cleanNormalized,
@@ -24,99 +24,62 @@ interface RawLineItem {
   words: RawWordItem[];
 }
 
-export interface SnapshotScanOutput {
-  result: ScanResult;
-  snapshotCanvas: HTMLCanvasElement;
+interface BandScanSnapshot {
+  matches: MatchedWord[];
+  timestamp: number;
 }
 
 const FAST_LANG_CDN = 'https://tessdata.projectnaptha.com/4.0.0_fast';
-export const MAX_SNAPSHOT_LONG_EDGE = 1800;
-const PARALLEL_WORKERS = 2;
+export const STRIP_W = 960;
+export const STRIP_H = 320;
+const NUM_STRIPS = 3;
+const BOX_TTL_MS = 400;
 
 /**
- * Precomputed 256-entry Contrast Stretch Lookup Table (LUT) for faint thermal receipt ink.
- * Pulls gray ink (< 142) sharply toward pure black (0) and paper background (> 180) to pure white (255)
- * while preserving smooth anti-aliased character edges so small serial numbers read cleanly.
+ * 3 Overlapping Horizontal Strips covering 10% to 90% of video height:
+ * - Band 0 (Top Zone):    10% -> 42%
+ * - Band 1 (Center Zone): 34% -> 66%
+ * - Band 2 (Bottom Zone): 58% -> 90%
  */
-const THERMAL_CONTRAST_LUT = new Uint8Array(256);
-for (let i = 0; i < 256; i++) {
-  if (i <= 92) {
-    THERMAL_CONTRAST_LUT[i] = 0;
-  } else if (i >= 188) {
-    THERMAL_CONTRAST_LUT[i] = 255;
-  } else {
-    const normalized = (i - 92) / (188 - 92);
-    const sCurve =
-      normalized < 0.5
-        ? 2 * normalized * normalized
-        : 1 - Math.pow(-2 * normalized + 2, 2) / 2;
-    THERMAL_CONTRAST_LUT[i] = Math.min(255, Math.max(0, Math.round(sCurve * 255)));
-  }
-}
+const HORIZONTAL_BANDS: ReadonlyArray<{ startRatio: number; endRatio: number }> = [
+  { startRatio: 0.10, endRatio: 0.42 },
+  { startRatio: 0.34, endRatio: 0.66 },
+  { startRatio: 0.58, endRatio: 0.90 },
+];
 
-/**
- * Ultra-fast Uint32Array grayscale + thermal contrast stretch on the OCR copy canvas
- */
-function applyThermalReceiptContrastLUT(
-  ctx: CanvasRenderingContext2D,
-  w: number,
-  h: number
-): void {
-  try {
-    const imgData = ctx.getImageData(0, 0, w, h);
-    const data8 = imgData.data;
-    const buf32 = new Uint32Array(data8.buffer);
-    const len = buf32.length;
-
-    for (let i = 0; i < len; i++) {
-      const px = buf32[i];
-      const r = px & 0xff;
-      const g = (px >> 8) & 0xff;
-      const b = (px >> 16) & 0xff;
-      const luma = (r * 77 + g * 150 + b * 29) >> 8;
-      const c = THERMAL_CONTRAST_LUT[luma];
-      buf32[i] = (255 << 24) | (c << 16) | (c << 8) | c;
-    }
-
-    ctx.putImageData(imgData, 0, 0);
-  } catch {
-    // Fallback to raw frame if canvas security blocks getImageData
-  }
-}
-
-// Module-level singleton 2-worker scheduler cache so opening the camera has 0ms startup delay
-let singletonScheduler: Scheduler | null = null;
+// Module-level singleton 3-worker pool so opening the camera has 0ms startup delay
 let singletonWorkers: Worker[] = [];
 let singletonLang: OcrLanguage | null = null;
-let singletonInitPromise: Promise<Scheduler> | null = null;
+let singletonInitPromise: Promise<Worker[]> | null = null;
 
-async function getOrCreateSingletonScheduler(lang: OcrLanguage): Promise<Scheduler> {
-  if (singletonScheduler && singletonLang === lang) {
-    return singletonScheduler;
+async function getOrCreateThreeWorkers(lang: OcrLanguage): Promise<Worker[]> {
+  if (singletonWorkers.length === NUM_STRIPS && singletonLang === lang) {
+    return singletonWorkers;
   }
 
   if (singletonInitPromise && singletonLang === lang) {
     return singletonInitPromise;
   }
 
-  if (singletonScheduler && singletonLang !== lang) {
-    const oldScheduler = singletonScheduler;
-    singletonScheduler = null;
+  if (singletonWorkers.length > 0 && singletonLang !== lang) {
+    const oldWorkers = singletonWorkers;
     singletonWorkers = [];
     singletonLang = null;
     singletonInitPromise = null;
-    try {
-      await oldScheduler.terminate();
-    } catch {
-      // ignore
-    }
+    await Promise.all(
+      oldWorkers.map(async (w) => {
+        try {
+          await w.terminate();
+        } catch {
+          // ignore
+        }
+      })
+    );
   }
 
   singletonLang = lang;
   singletonInitPromise = (async () => {
-    const scheduler = createScheduler();
-
-    const createFastMatrixWorker = async (): Promise<Worker> => {
+    const createStripWorker = async (): Promise<Worker> => {
       let worker: Worker;
       try {
         worker = await createWorker(lang, 1, {
@@ -127,8 +90,7 @@ async function getOrCreateSingletonScheduler(lang: OcrLanguage): Promise<Schedul
       }
 
       await worker.setParameters({
-        tessedit_pageseg_mode: PSM.SINGLE_BLOCK, // '6' - Full-screen spatial matrix block
-        user_defined_dpi: '300',
+        tessedit_pageseg_mode: PSM.SINGLE_BLOCK, // '6'
         load_system_dawg: '0',
         load_freq_dawg: '0',
         tessjs_create_hocr: '0',
@@ -142,22 +104,16 @@ async function getOrCreateSingletonScheduler(lang: OcrLanguage): Promise<Schedul
     };
 
     const workers = await Promise.all(
-      Array.from({ length: PARALLEL_WORKERS }, () => createFastMatrixWorker())
+      Array.from({ length: NUM_STRIPS }, () => createStripWorker())
     );
 
-    for (const w of workers) {
-      scheduler.addWorker(w);
-    }
-
-    singletonScheduler = scheduler;
     singletonWorkers = workers;
-    return scheduler;
+    return workers;
   })();
 
   try {
     return await singletonInitPromise;
   } catch (err) {
-    singletonScheduler = null;
     singletonWorkers = [];
     singletonLang = null;
     singletonInitPromise = null;
@@ -166,48 +122,55 @@ async function getOrCreateSingletonScheduler(lang: OcrLanguage): Promise<Schedul
 }
 
 /**
- * Pre-warms the persistent 2-worker 4.0.0_fast scheduler on App startup
+ * Pre-warms the 3 parallel 4.0.0_fast workers on App load
  */
 export function prewarmOCRWorker(lang: OcrLanguage): void {
-  void getOrCreateSingletonScheduler(lang).catch(() => {
+  void getOrCreateThreeWorkers(lang).catch(() => {
     // handled when scanner mounts
   });
 }
 
 export function useOCRScanner(selectedLang: OcrLanguage, liveChecklist: ChecklistItem[] = []) {
   const alreadyReady =
-    singletonScheduler !== null &&
-    singletonWorkers.length === PARALLEL_WORKERS &&
-    singletonLang === selectedLang;
+    singletonWorkers.length === NUM_STRIPS && singletonLang === selectedLang;
 
   const [isInitializing, setIsInitializing] = useState(!alreadyReady);
-  const [isScanningSnapshot, setIsScanningSnapshot] = useState(false);
   const [lastScanResult, setLastScanResult] = useState<ScanResult | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  const schedulerRef = useRef<Scheduler | null>(alreadyReady ? singletonScheduler : null);
-  const ocrCanvasPoolRef = useRef<[HTMLCanvasElement | null, HTMLCanvasElement | null]>([
+  const workersRef = useRef<Worker[]>(alreadyReady ? singletonWorkers : []);
+  // 3 dedicated 960x320 offscreen canvases (one per horizontal strip)
+  const stripCanvasesRef = useRef<[HTMLCanvasElement | null, HTMLCanvasElement | null, HTMLCanvasElement | null]>([
     null,
-    null,
-  ]);
-  const displayCanvasPoolRef = useRef<[HTMLCanvasElement | null, HTMLCanvasElement | null]>([
     null,
     null,
   ]);
-  const poolIdxRef = useRef<number>(0);
-  const activeJobsRef = useRef<number>(0);
+  const bandBusyRef = useRef<[boolean, boolean, boolean]>([false, false, false]);
+  const bandResultsRef = useRef<[BandScanSnapshot, BandScanSnapshot, BandScanSnapshot]>([
+    { matches: [], timestamp: 0 },
+    { matches: [], timestamp: 0 },
+    { matches: [], timestamp: 0 },
+  ]);
+  const previousMatchedItemIdsRef = useRef<Set<string>>(new Set());
 
   // Live checklist ref & completed tombstone set
   const activeItemsRef = useRef<ChecklistItem[]>(liveChecklist);
   activeItemsRef.current = liveChecklist;
   const completedTombstonesRef = useRef<Set<string>>(new Set());
 
+  // Sync tombstones and prune completed items when checklist changes
   useEffect(() => {
     const currentActiveIds = new Set(liveChecklist.map((i) => i.id));
     for (const id of Array.from(completedTombstonesRef.current)) {
       if (currentActiveIds.has(id)) {
         completedTombstonesRef.current.delete(id);
       }
+    }
+
+    for (let b = 0; b < NUM_STRIPS; b++) {
+      bandResultsRef.current[b].matches = bandResultsRef.current[b].matches.filter(
+        (w) => w.matchedItemId && currentActiveIds.has(w.matchedItemId)
+      );
     }
 
     setLastScanResult((prev) => {
@@ -233,9 +196,15 @@ export function useOCRScanner(selectedLang: OcrLanguage, liveChecklist: Checklis
     });
   }, [liveChecklist]);
 
-  // Immediately purge a single completed item from OCR state
+  // Immediately purge a single completed item from all 3 strips & state
   const purgeItem = useCallback((itemId: string) => {
     completedTombstonesRef.current.add(itemId);
+    previousMatchedItemIdsRef.current.delete(itemId);
+    for (let b = 0; b < NUM_STRIPS; b++) {
+      bandResultsRef.current[b].matches = bandResultsRef.current[b].matches.filter(
+        (w) => w.matchedItemId !== itemId
+      );
+    }
     setLastScanResult((prev) => {
       if (!prev) return null;
       const filteredWords = prev.matchedWords.filter((w) => w.matchedItemId !== itemId);
@@ -254,6 +223,12 @@ export function useOCRScanner(selectedLang: OcrLanguage, liveChecklist: Checklis
     const idSet = new Set(itemIds);
     for (const id of idSet) {
       completedTombstonesRef.current.add(id);
+      previousMatchedItemIdsRef.current.delete(id);
+    }
+    for (let b = 0; b < NUM_STRIPS; b++) {
+      bandResultsRef.current[b].matches = bandResultsRef.current[b].matches.filter(
+        (w) => !w.matchedItemId || !idSet.has(w.matchedItemId)
+      );
     }
     setLastScanResult((prev) => {
       if (!prev) return null;
@@ -270,13 +245,13 @@ export function useOCRScanner(selectedLang: OcrLanguage, liveChecklist: Checklis
     });
   }, []);
 
-  // Attach to or initialize the singleton 2-worker scheduler
+  // Attach to or initialize the 3 parallel workers
   useEffect(() => {
     let isCancelled = false;
 
-    async function attachScheduler() {
-      if (singletonScheduler && singletonLang === selectedLang) {
-        schedulerRef.current = singletonScheduler;
+    async function attachWorkers() {
+      if (singletonWorkers.length === NUM_STRIPS && singletonLang === selectedLang) {
+        workersRef.current = singletonWorkers;
         setIsInitializing(false);
         setError(null);
         return;
@@ -284,15 +259,15 @@ export function useOCRScanner(selectedLang: OcrLanguage, liveChecklist: Checklis
 
       setIsInitializing(true);
       try {
-        const sched = await getOrCreateSingletonScheduler(selectedLang);
+        const workers = await getOrCreateThreeWorkers(selectedLang);
         if (!isCancelled) {
-          schedulerRef.current = sched;
+          workersRef.current = workers;
           setIsInitializing(false);
           setError(null);
         }
       } catch (err) {
         if (!isCancelled) {
-          console.error('OCR scheduler init error:', err);
+          console.error('OCR 3-worker init error:', err);
           const errorMsg = err instanceof Error ? err.message : String(err);
           setError(`Worker Error: ${errorMsg}`);
           setIsInitializing(false);
@@ -300,7 +275,7 @@ export function useOCRScanner(selectedLang: OcrLanguage, liveChecklist: Checklis
       }
     }
 
-    attachScheduler();
+    attachWorkers();
 
     return () => {
       isCancelled = true;
@@ -308,26 +283,123 @@ export function useOCRScanner(selectedLang: OcrLanguage, liveChecklist: Checklis
   }, [selectedLang]);
 
   /**
-   * High-Resolution Snapshot Capture & Simultaneous Multi-Target OCR:
-   * 1. Captures the full camera frame at native high resolution (up to 1800px on the long edge)
-   *    into `displayCanvas` (clean color bitmap for FROZEN_LOCK display) and `ocrCanvas` (contrast-boosted for OCR).
-   * 2. Because `displayCanvas` and `ocrCanvas` share the EXACT same width & height (`snapW x snapH`) with zero cropping offset,
-   *    every matched bounding box `(x0, y0, x1, y1)` is 100% pixel-locked to `displayCanvas` with 0.00px drift!
+   * Merges the latest fresh (< 400ms) matches across all 3 horizontal strips,
+   * deduplicating overlapping hits in the 8% overlap zones between adjacent bands,
+   * and immediately emits the unified ScanResult in full video coordinates (videoW x videoH).
    */
-  const scanSnapshot = useCallback(
-    async (
-      source: HTMLVideoElement | HTMLCanvasElement | HTMLImageElement,
-      _mode: MatchMode,
-      options?: {
-        forceCaptureCanvas?: HTMLCanvasElement;
-        enableHaptics?: boolean;
-        enableSound?: boolean;
+  const emitMergedStripResults = useCallback(
+    (
+      videoW: number,
+      videoH: number,
+      processingTimeMs: number,
+      enableHaptics: boolean,
+      enableSound: boolean
+    ): ScanResult => {
+      const now = performance.now();
+      const freshTargets = activeItemsRef.current.filter(
+        (item) => !item.isCompleted && !completedTombstonesRef.current.has(item.id)
+      );
+      const activeIdSet = new Set(freshTargets.map((t) => t.id));
+
+      const mergedWords: MatchedWord[] = [];
+      const matchesByItem = new Map<string, MatchedWord[]>();
+
+      for (let b = 0; b < NUM_STRIPS; b++) {
+        const snapshot = bandResultsRef.current[b];
+        if (now - snapshot.timestamp > BOX_TTL_MS) {
+          snapshot.matches = [];
+          continue;
+        }
+
+        for (const w of snapshot.matches) {
+          if (
+            !w.matchedItemId ||
+            !activeIdSet.has(w.matchedItemId) ||
+            completedTombstonesRef.current.has(w.matchedItemId)
+          ) {
+            continue;
+          }
+
+          const listForItem = matchesByItem.get(w.matchedItemId) || [];
+          // Deduplicate same row detected in the 8% overlap between adjacent strips
+          const isOverlapDuplicate = listForItem.some(
+            (ex) =>
+              Math.abs(ex.bbox.y0 - w.bbox.y0) < 26 &&
+              Math.abs(ex.bbox.x0 - w.bbox.x0) < 50
+          );
+
+          if (!isOverlapDuplicate) {
+            mergedWords.push(w);
+            listForItem.push(w);
+            matchesByItem.set(w.matchedItemId, listForItem);
+          }
+        }
       }
-    ): Promise<SnapshotScanOutput | null> => {
-      const scheduler = schedulerRef.current;
+
+      const detectedGroups: DetectedMatchGroup[] = [];
+      for (const target of freshTargets) {
+        const words = matchesByItem.get(target.id);
+        if (words && words.length > 0) {
+          const primaryWord = words.reduce(
+            (prev, curr) => (curr.confidence > prev.confidence ? curr : prev),
+            words[0]
+          );
+          detectedGroups.push({
+            item: target,
+            words,
+            primaryWord,
+          });
+        }
+      }
+
+      const result: ScanResult = {
+        allWords: mergedWords,
+        matchedWords: mergedWords,
+        detectedGroups,
+        fullText: '',
+        processingTimeMs,
+        frameWidth: videoW,
+        frameHeight: videoH,
+      };
+
+      setLastScanResult(result);
+
+      const currentMatchedIds = new Set(detectedGroups.map((g) => g.item.id));
+      let hasNewMatch = false;
+      for (const id of currentMatchedIds) {
+        if (!previousMatchedItemIdsRef.current.has(id)) {
+          hasNewMatch = true;
+          break;
+        }
+      }
+
+      if (hasNewMatch) {
+        if (enableHaptics) triggerHaptic(60);
+        if (enableSound) playMatchChime();
+      }
+      previousMatchedItemIdsRef.current = currentMatchedIds;
+
+      return result;
+    },
+    []
+  );
+
+  /**
+   * Scans a single horizontal strip (0 = Top 10%-42%, 1 = Center 34%-66%, 2 = Bottom 58%-90%)
+   * at 960x320 resolution on its dedicated Web Worker thread (~110ms-140ms) and immediately
+   * maps any matches back to full intrinsic video coordinates (videoW x videoH).
+   */
+  const scanBandIndex = useCallback(
+    async (
+      bandIdx: 0 | 1 | 2,
+      source: HTMLVideoElement | HTMLCanvasElement | HTMLImageElement,
+      enableHaptics = true,
+      enableSound = true
+    ): Promise<ScanResult | null> => {
+      const worker = workersRef.current[bandIdx];
       if (
-        !scheduler ||
-        activeJobsRef.current >= PARALLEL_WORKERS ||
+        !worker ||
+        bandBusyRef.current[bandIdx] ||
         isInitializing ||
         activeItemsRef.current.length === 0
       ) {
@@ -340,91 +412,86 @@ export function useOCRScanner(selectedLang: OcrLanguage, liveChecklist: Checklis
         }
       }
 
-      let srcW = 0;
-      let srcH = 0;
+      let videoW = 0;
+      let videoH = 0;
       if (source instanceof HTMLVideoElement) {
-        srcW = source.videoWidth;
-        srcH = source.videoHeight;
+        videoW = source.videoWidth;
+        videoH = source.videoHeight;
       } else if (source instanceof HTMLCanvasElement) {
-        srcW = source.width;
-        srcH = source.height;
+        videoW = source.width;
+        videoH = source.height;
       } else if (source instanceof HTMLImageElement) {
-        srcW = source.naturalWidth || source.width;
-        srcH = source.naturalHeight || source.height;
+        videoW = source.naturalWidth || source.width;
+        videoH = source.naturalHeight || source.height;
       }
 
-      if (srcW === 0 || srcH === 0) {
+      if (videoW === 0 || videoH === 0) {
         return null;
       }
 
-      activeJobsRef.current += 1;
-      setIsScanningSnapshot(true);
+      bandBusyRef.current[bandIdx] = true;
       const startTime = performance.now();
 
       try {
-        // Full high-resolution capture (up to 1800px on the long edge — never downscaled to blurry sizes)
-        const longEdge = Math.max(srcW, srcH);
-        const scale = longEdge > MAX_SNAPSHOT_LONG_EDGE ? MAX_SNAPSHOT_LONG_EDGE / longEdge : 1;
-        const snapW = Math.max(1, Math.round(srcW * scale));
-        const snapH = Math.max(1, Math.round(srcH * scale));
+        const band = HORIZONTAL_BANDS[bandIdx];
+        const bandStartY = Math.round(videoH * band.startRatio);
+        const bandHeight = Math.max(1, Math.round(videoH * (band.endRatio - band.startRatio)));
 
-        const slot = poolIdxRef.current % PARALLEL_WORKERS;
-        poolIdxRef.current = (poolIdxRef.current + 1) % PARALLEL_WORKERS;
-
-        // 1. Clean high-res color snapshot canvas (rendered directly on screen in FROZEN_LOCK mode)
-        const displayCanvas =
-          options?.forceCaptureCanvas ||
-          displayCanvasPoolRef.current[slot] ||
-          (displayCanvasPoolRef.current[slot] = document.createElement('canvas'));
-
-        if (displayCanvas.width !== snapW || displayCanvas.height !== snapH) {
-          displayCanvas.width = snapW;
-          displayCanvas.height = snapH;
+        if (!stripCanvasesRef.current[bandIdx]) {
+          const c = document.createElement('canvas');
+          c.width = STRIP_W;
+          c.height = STRIP_H;
+          stripCanvasesRef.current[bandIdx] = c;
         }
-        const displayCtx = displayCanvas.getContext('2d', { alpha: false });
-        if (!displayCtx) return null;
-        displayCtx.imageSmoothingEnabled = true;
-        displayCtx.imageSmoothingQuality = 'high';
-        displayCtx.drawImage(source, 0, 0, snapW, snapH);
-
-        // 2. Identically sized OCR canvas (with fast thermal receipt contrast stretch)
-        if (!ocrCanvasPoolRef.current[slot]) {
-          ocrCanvasPoolRef.current[slot] = document.createElement('canvas');
+        const stripCanvas = stripCanvasesRef.current[bandIdx]!;
+        if (stripCanvas.width !== STRIP_W || stripCanvas.height !== STRIP_H) {
+          stripCanvas.width = STRIP_W;
+          stripCanvas.height = STRIP_H;
         }
-        const ocrCanvas = ocrCanvasPoolRef.current[slot]!;
-        if (ocrCanvas.width !== snapW || ocrCanvas.height !== snapH) {
-          ocrCanvas.width = snapW;
-          ocrCanvas.height = snapH;
-        }
-        const ocrCtx = ocrCanvas.getContext('2d', { alpha: false, willReadFrequently: true });
-        if (!ocrCtx) return null;
-        ocrCtx.drawImage(displayCanvas, 0, 0, snapW, snapH);
-        applyThermalReceiptContrastLUT(ocrCtx, snapW, snapH);
 
-        // Run Tesseract on the high-contrast OCR canvas
-        const ret = await scheduler.addJob('recognize', ocrCanvas);
+        const stripCtx = stripCanvas.getContext('2d', { alpha: false });
+        if (!stripCtx) return null;
+
+        // Draw clean raw horizontal band into 960x320 strip canvas (NO heavy pixel thresholding filters!)
+        stripCtx.drawImage(
+          source,
+          0,
+          bandStartY,
+          videoW,
+          bandHeight,
+          0,
+          0,
+          STRIP_W,
+          STRIP_H
+        );
+
+        const ret = await worker.recognize(stripCanvas);
         const data = ret.data;
-        const rawFullText = (data.text || '').trim();
 
         const freshTargets = activeItemsRef.current.filter(
           (item) => !item.isCompleted && !completedTombstonesRef.current.has(item.id)
         );
 
         if (freshTargets.length === 0) {
-          const emptyResult: ScanResult = {
-            allWords: [],
-            matchedWords: [],
-            detectedGroups: [],
-            fullText: rawFullText,
-            processingTimeMs: Math.round(performance.now() - startTime),
-            frameWidth: snapW,
-            frameHeight: snapH,
-          };
-          setLastScanResult(emptyResult);
-          return { result: emptyResult, snapshotCanvas: displayCanvas };
+          bandResultsRef.current[bandIdx] = { matches: [], timestamp: performance.now() };
+          return emitMergedStripResults(
+            videoW,
+            videoH,
+            Math.round(performance.now() - startTime),
+            enableHaptics,
+            enableSound
+          );
         }
 
         const preparedTargets = prepareTargets(freshTargets);
+
+        // Convert strip (960 x 320) coordinates directly to full intrinsic video (videoW x videoH)
+        const toFullVideoBbox = (b: { x0: number; y0: number; x1: number; y1: number }) => ({
+          x0: (b.x0 / STRIP_W) * videoW,
+          y0: bandStartY + (b.y0 / STRIP_H) * bandHeight,
+          x1: (b.x1 / STRIP_W) * videoW,
+          y1: bandStartY + (b.y1 / STRIP_H) * bandHeight,
+        });
 
         const wordsList: RawWordItem[] = [];
         const linesList: RawLineItem[] = [];
@@ -533,9 +600,8 @@ export function useOCRScanner(selectedLang: OcrLanguage, liveChecklist: Checklis
           }
         }
 
-        // Strict character-accurate substring matching (with 0<->O and 1<->I equivalence only)
-        const matchedWords: MatchedWord[] = [];
-        const matchesByItem = new Map<string, MatchedWord[]>();
+        // Strict Substring Matching (with 0<->O and 1<->I equivalence) across all targets simultaneously
+        const bandMatches: MatchedWord[] = [];
 
         for (let wIdx = 0; wIdx < wordsList.length; wIdx++) {
           const w = wordsList[wIdx];
@@ -553,42 +619,31 @@ export function useOCRScanner(selectedLang: OcrLanguage, liveChecklist: Checklis
               serialWord.includes(pt.serialLookalikeTarget);
 
             if (isDirectHit || isSerialLookalikeHit) {
-              const slicedBbox = sliceSubTokenBbox(
+              const slicedStripBbox = sliceSubTokenBbox(
                 w.bbox,
                 w.text,
                 pt.rawTrimmed,
                 cleanWord,
                 pt.cleanTarget
               );
+              const fullVideoBbox = toFullVideoBbox(slicedStripBbox);
 
-              const listForTarget = matchesByItem.get(pt.item.id) || [];
-              const isDuplicateRowHit = listForTarget.some(
-                (ex) =>
-                  Math.abs(ex.bbox.y0 - slicedBbox.y0) < 14 &&
-                  Math.abs(ex.bbox.x0 - slicedBbox.x0) < 36
-              );
-
-              if (!isDuplicateRowHit) {
-                const matchObj: MatchedWord = {
-                  id: `m-${pt.item.id}-${wIdx}-${tIdx}`,
-                  text: w.text,
-                  normalizedText: cleanWord,
-                  confidence: w.confidence,
-                  bbox: slicedBbox,
-                  isMatch: true,
-                  score: isDirectHit ? 1.0 : 0.96,
-                  matchedItemId: pt.item.id,
-                  matchedItemText: pt.item.text,
-                };
-                matchedWords.push(matchObj);
-                listForTarget.push(matchObj);
-                matchesByItem.set(pt.item.id, listForTarget);
-              }
+              bandMatches.push({
+                id: `b${bandIdx}-${pt.item.id}-${wIdx}-${tIdx}`,
+                text: w.text,
+                normalizedText: cleanWord,
+                confidence: w.confidence,
+                bbox: fullVideoBbox,
+                isMatch: true,
+                score: isDirectHit ? 1.0 : 0.96,
+                matchedItemId: pt.item.id,
+                matchedItemText: pt.item.text,
+              });
             }
           }
         }
 
-        // Sliding window across adjacent words on the same line for multi-word targets
+        // Sliding-window evaluation across adjacent words on the same line for multi-word targets
         for (let lIdx = 0; lIdx < linesList.length; lIdx++) {
           const line = linesList[lIdx];
           const lWords = line.words;
@@ -598,7 +653,6 @@ export function useOCRScanner(selectedLang: OcrLanguage, liveChecklist: Checklis
             const pt = preparedTargets[tIdx];
             if (completedTombstonesRef.current.has(pt.item.id)) continue;
 
-            const listForTarget = matchesByItem.get(pt.item.id) || [];
             const windowLen = Math.max(2, pt.parts.length);
             const maxWin = Math.min(lWords.length, windowLen + 1);
 
@@ -615,98 +669,77 @@ export function useOCRScanner(selectedLang: OcrLanguage, liveChecklist: Checklis
 
                 if (!isHit) continue;
 
-                const unionBbox = {
+                const unionStripBbox = {
                   x0: Math.min(...slice.map((sw) => sw.bbox.x0)),
                   y0: Math.min(...slice.map((sw) => sw.bbox.y0)),
                   x1: Math.max(...slice.map((sw) => sw.bbox.x1)),
                   y1: Math.max(...slice.map((sw) => sw.bbox.y1)),
                 };
+                const fullVideoBbox = toFullVideoBbox(unionStripBbox);
 
-                const isDuplicateRowHit = listForTarget.some(
-                  (ex) =>
-                    Math.abs(ex.bbox.y0 - unionBbox.y0) < 14 &&
-                    Math.abs(ex.bbox.x0 - unionBbox.x0) < 36
-                );
-
-                if (!isDuplicateRowHit) {
-                  const matchObj: MatchedWord = {
-                    id: `mw-${pt.item.id}-${lIdx}-${start}`,
-                    text: slice.map((sw) => sw.text).join(' '),
-                    normalizedText: combinedClean,
-                    confidence: line.confidence,
-                    bbox: unionBbox,
-                    isMatch: true,
-                    score: 0.95,
-                    matchedItemId: pt.item.id,
-                    matchedItemText: pt.item.text,
-                  };
-                  matchedWords.push(matchObj);
-                  listForTarget.push(matchObj);
-                  matchesByItem.set(pt.item.id, listForTarget);
-                }
+                bandMatches.push({
+                  id: `b${bandIdx}-mw-${pt.item.id}-${lIdx}-${start}`,
+                  text: slice.map((sw) => sw.text).join(' '),
+                  normalizedText: combinedClean,
+                  confidence: line.confidence,
+                  bbox: fullVideoBbox,
+                  isMatch: true,
+                  score: 0.95,
+                  matchedItemId: pt.item.id,
+                  matchedItemText: pt.item.text,
+                });
               }
             }
           }
         }
 
-        const detectedGroups: DetectedMatchGroup[] = [];
-        for (const target of freshTargets) {
-          if (completedTombstonesRef.current.has(target.id)) continue;
-          const words = matchesByItem.get(target.id);
-          if (words && words.length > 0) {
-            const primaryWord = words.reduce(
-              (prev, curr) => (curr.confidence > prev.confidence ? curr : prev),
-              words[0]
-            );
-            detectedGroups.push({
-              item: target,
-              words,
-              primaryWord,
-            });
-          }
-        }
-
-        const endTime = performance.now();
-        const result: ScanResult = {
-          allWords: matchedWords,
-          matchedWords,
-          detectedGroups,
-          fullText: rawFullText,
-          processingTimeMs: Math.round(endTime - startTime),
-          frameWidth: snapW,
-          frameHeight: snapH,
+        // Update this strip's snapshot and immediately emit merged results across all 3 strips!
+        bandResultsRef.current[bandIdx] = {
+          matches: bandMatches,
+          timestamp: performance.now(),
         };
 
-        setLastScanResult(result);
-
-        if (detectedGroups.length > 0) {
-          if (options?.enableHaptics !== false) triggerHaptic(70);
-          if (options?.enableSound !== false) playMatchChime();
-        }
-
-        return {
-          result,
-          snapshotCanvas: displayCanvas,
-        };
+        return emitMergedStripResults(
+          videoW,
+          videoH,
+          Math.round(performance.now() - startTime),
+          enableHaptics,
+          enableSound
+        );
       } catch (err) {
-        console.warn('Snapshot OCR scan error:', err);
+        console.warn(`OCR strip ${bandIdx} scan error:`, err);
         return null;
       } finally {
-        activeJobsRef.current = Math.max(0, activeJobsRef.current - 1);
-        if (activeJobsRef.current === 0) {
-          setIsScanningSnapshot(false);
-        }
+        bandBusyRef.current[bandIdx] = false;
       }
     },
-    [isInitializing]
+    [isInitializing, emitMergedStripResults]
+  );
+
+  /**
+   * Fires all 3 horizontal strips in parallel across the 3 workers.
+   */
+  const scanAllStripsParallel = useCallback(
+    async (
+      source: HTMLVideoElement | HTMLCanvasElement | HTMLImageElement,
+      enableHaptics = true,
+      enableSound = true
+    ): Promise<void> => {
+      await Promise.all([
+        scanBandIndex(0, source, enableHaptics, enableSound),
+        scanBandIndex(1, source, enableHaptics, enableSound),
+        scanBandIndex(2, source, enableHaptics, enableSound),
+      ]);
+    },
+    [scanBandIndex]
   );
 
   return {
     isInitializing,
-    isScanningSnapshot,
     lastScanResult,
     error,
-    scanSnapshot,
+    scanBandIndex,
+    scanAllStripsParallel,
     purgeItem,
     purgeMultipleItems,
   };
