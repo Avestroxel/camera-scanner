@@ -163,6 +163,14 @@ export default function App() {
     );
   };
 
+  const handleCompleteMultipleItems = (items: ChecklistItem[]) => {
+    const idSet = new Set(items.map((i) => i.id));
+    const now = Date.now();
+    setChecklist((prev) =>
+      prev.map((i) => (idSet.has(i.id) ? { ...i, isCompleted: true, completedAt: now } : i))
+    );
+  };
+
   const handleRestartBatch = () => {
     setChecklist((prev) =>
       prev.map((item) => ({ ...item, isCompleted: false, completedAt: undefined }))
@@ -212,6 +220,7 @@ export default function App() {
           isRtl={isRtl}
           onBack={() => setCurrentView('home')}
           onCompleteItem={handleCompleteItem}
+          onCompleteMultipleItems={handleCompleteMultipleItems}
           onRestartBatch={handleRestartBatch}
         />
       )}

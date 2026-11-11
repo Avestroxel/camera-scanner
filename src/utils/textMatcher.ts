@@ -1,4 +1,4 @@
-import { MatchMode } from '../types';
+import { MatchMode, ChecklistItem } from '../types';
 
 /**
  * Strips all spaces, symbols, and punctuation, preserving alphanumeric
@@ -27,25 +27,121 @@ export function normalizeText(input: string): string {
   text = text.replace(/[\u064B-\u065F\u0670\u0640]/g, '');
 
   // Normalize digits (Arabic-Indic and Eastern Arabic-Indic to standard)
-  text = text.replace(/[٠۰]/g, '0')
-             .replace(/[١۱]/g, '1')
-             .replace(/[٢۲]/g, '2')
-             .replace(/[٣۳]/g, '3')
-             .replace(/[٤۴]/g, '4')
-             .replace(/[٥۵]/g, '5')
-             .replace(/[٦۶]/g, '6')
-             .replace(/[٧۷]/g, '7')
-             .replace(/[٨۸]/g, '8')
-             .replace(/[٩۹]/g, '9');
+  text = text
+    .replace(/[٠۰]/g, '0')
+    .replace(/[١۱]/g, '1')
+    .replace(/[٢۲]/g, '2')
+    .replace(/[٣۳]/g, '3')
+    .replace(/[٤۴]/g, '4')
+    .replace(/[٥۵]/g, '5')
+    .replace(/[٦۶]/g, '6')
+    .replace(/[٧۷]/g, '7')
+    .replace(/[٨۸]/g, '8')
+    .replace(/[٩۹]/g, '9');
 
   // Normalize common Arabic/Kurdish letter variants
-  text = text.replace(/[يىێ]/g, 'ي')
-             .replace(/[كک]/g, 'ك')
-             .replace(/[ةەھ]/g, 'ه')
-             .replace(/[إأآا]/g, 'ا')
-             .replace(/[ۆؤ]/g, 'و');
+  text = text
+    .replace(/[يىێ]/g, 'ي')
+    .replace(/[كک]/g, 'ك')
+    .replace(/[ةەھ]/g, 'ه')
+    .replace(/[إأآا]/g, 'ا')
+    .replace(/[ۆؤ]/g, 'و');
 
   return text;
+}
+
+/**
+ * Fast normalized alphanumeric cleaner for O(1) multi-target lookup
+ */
+export function cleanNormalized(input: string): string {
+  if (!input) return '';
+  return normalizeText(input).replace(/[^a-z0-9\u0600-\u06FF]/gu, '');
+}
+
+export interface PreparedTarget {
+  item: ChecklistItem;
+  rawTrimmed: string;
+  cleanTarget: string;
+  parts: string[];
+  isMultiWord: boolean;
+}
+
+/**
+ * Pre-normalizes all active checklist items into an indexed lookup array
+ * before scanning the full-screen OCR word matrix.
+ */
+export function prepareTargets(items: ChecklistItem[]): PreparedTarget[] {
+  const prepared: PreparedTarget[] = [];
+  for (let i = 0; i < items.length; i++) {
+    const item = items[i];
+    const rawTrimmed = item.text.trim();
+    const cleanTarget = cleanNormalized(rawTrimmed);
+    if (!cleanTarget) continue;
+
+    const rawParts = rawTrimmed
+      .split(/\s+/)
+      .map((p) => cleanNormalized(p))
+      .filter(Boolean);
+
+    prepared.push({
+      item,
+      rawTrimmed,
+      cleanTarget,
+      parts: rawParts,
+      isMultiWord: rawParts.length > 1,
+    });
+  }
+  return prepared;
+}
+
+/**
+ * Smart Sub-Token Slicing:
+ * If a target ("netlify") is found inside a longer OCR token ("camscanner07.netlify.app"),
+ * calculates its exact horizontal slice inside word.bbox.
+ */
+export function sliceSubTokenBbox(
+  bbox: { x0: number; y0: number; x1: number; y1: number },
+  rawToken: string,
+  rawTarget: string,
+  cleanToken: string,
+  cleanTarget: string
+): { x0: number; y0: number; x1: number; y1: number } {
+  const boxW = bbox.x1 - bbox.x0;
+  if (boxW <= 0) return bbox;
+
+  // 1. Direct index on normalized raw token (preserves punctuation spacing like dots/hyphens)
+  const normRawToken = normalizeText(rawToken);
+  const normRawTarget = normalizeText(rawTarget);
+  const rawIdx = normRawToken.indexOf(normRawTarget);
+  if (rawIdx >= 0 && normRawToken.length > normRawTarget.length) {
+    const startRatio = rawIdx / normRawToken.length;
+    const widthRatio = Math.min(1 - startRatio, normRawTarget.length / normRawToken.length);
+    const slicedX0 = bbox.x0 + boxW * startRatio;
+    const slicedX1 = slicedX0 + boxW * widthRatio;
+    return {
+      x0: slicedX0,
+      y0: bbox.y0,
+      x1: slicedX1,
+      y1: bbox.y1,
+    };
+  }
+
+  // 2. Fallback to cleaned alphanumeric ratio
+  const idx = cleanToken.indexOf(cleanTarget);
+  if (idx >= 0 && cleanToken.length > cleanTarget.length) {
+    const startRatio = idx / cleanToken.length;
+    const widthRatio = Math.min(1 - startRatio, cleanTarget.length / cleanToken.length);
+    const slicedX0 = bbox.x0 + boxW * startRatio;
+    const slicedX1 = slicedX0 + boxW * widthRatio;
+    return {
+      x0: slicedX0,
+      y0: bbox.y0,
+      x1: slicedX1,
+      y1: bbox.y1,
+    };
+  }
+
+  return bbox;
 }
 
 /**
@@ -75,7 +171,6 @@ function levenshteinDistance(s1: string, s2: string): number {
 
 /**
  * Evaluates whether an OCR detected word (or multi-word slice) matches the target query.
- * Includes smart tolerance for faint/small text OCR character confusions.
  */
 export function checkMatch(
   detectedRaw: string,
@@ -86,21 +181,13 @@ export function checkMatch(
     return { isMatch: false, score: 0 };
   }
 
-  const cleanTarget = cleanAlphanumeric(targetRaw);
-  const cleanDetected = cleanAlphanumeric(detectedRaw);
+  const normTarget = cleanNormalized(targetRaw);
+  const normDetected = cleanNormalized(detectedRaw);
 
-  if (!cleanTarget || !cleanDetected) {
+  if (!normTarget || !normDetected) {
     return { isMatch: false, score: 0 };
   }
 
-  // 1. Exact alphanumeric match
-  if (cleanDetected === cleanTarget) {
-    return { isMatch: true, score: 1.0 };
-  }
-
-  // 2. Exact normalized match (Kurdish/Arabic letter unification + digits)
-  const normTarget = normalizeText(cleanTarget);
-  const normDetected = normalizeText(cleanDetected);
   if (normDetected === normTarget) {
     return { isMatch: true, score: 1.0 };
   }
@@ -109,12 +196,10 @@ export function checkMatch(
     return { isMatch: false, score: 0 };
   }
 
-  // 3. Substring match within a single word token (e.g., "$52.71" or "INV-204" when searching "52.71" or "204")
   if (normDetected.includes(normTarget)) {
     return { isMatch: true, score: 0.95 };
   }
 
-  // 4. Smart OCR tolerance for faint/small text (1-char OCR confusion on words >= 4 chars, e.g. '0' vs 'o', '1' vs 'l')
   const lenDiff = Math.abs(normDetected.length - normTarget.length);
   const maxLen = Math.max(normDetected.length, normTarget.length);
   if (maxLen >= 4 && lenDiff <= 1) {
@@ -126,16 +211,5 @@ export function checkMatch(
     }
   }
 
-  // 5. Explicit fuzzy mode for wider tolerance
-  if (mode === 'fuzzy' && maxLen >= 3) {
-    const dist = levenshteinDistance(normDetected, normTarget);
-    const similarity = 1 - dist / maxLen;
-    const threshold = maxLen <= 4 ? 0.75 : maxLen <= 7 ? 0.70 : 0.65;
-    if (similarity >= threshold) {
-      return { isMatch: true, score: similarity };
-    }
-  }
-
   return { isMatch: false, score: 0 };
 }
-

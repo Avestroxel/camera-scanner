@@ -3,15 +3,15 @@ import {
   ArrowLeft,
   Zap,
   ZapOff,
-  CheckCircle2,
   X,
   Check,
+  CheckCheck,
   ChevronDown,
   RefreshCw,
 } from 'lucide-react';
-import { OcrLanguage, MatchMode, MatchedWord, ChecklistItem, DetectedMatchGroup } from '../types';
+import { OcrLanguage, MatchMode, ChecklistItem, DetectedMatchGroup } from '../types';
 import { Translation } from '../translations';
-import { useOCRScanner } from '../hooks/useOCRScanner';
+import { useOCRScanner, OCR_MATRIX_WIDTH } from '../hooks/useOCRScanner';
 import { CelebrationOverlay } from './CelebrationOverlay';
 import { triggerHaptic } from '../utils/audioAlert';
 
@@ -25,26 +25,27 @@ interface Props {
   isRtl: boolean;
   onBack: () => void;
   onCompleteItem: (item: ChecklistItem) => void;
+  onCompleteMultipleItems?: (items: ChecklistItem[]) => void;
   onRestartBatch: () => void;
 }
 
-interface StickyBoxTrack {
-  key: string;
-  matchedItemId?: string;
-  // Coordinates in 1024px ocrCanvas space
+interface TrackedSpatialBox {
+  spatialId: string;
+  targetId: string;
+  // Coordinates in 1152px ocrCanvas matrix space
   bbox: { x0: number; y0: number; x1: number; y1: number };
-  // Screen-space smoothed coordinates
-  x: number;
-  y: number;
-  w: number;
-  h: number;
+  // Rendered screen-space coordinates
+  renderX: number;
+  renderY: number;
+  renderW: number;
+  renderH: number;
   lastSeenTimestamp: number;
   missedFrames: number;
   initialized: boolean;
 }
 
-const LOCK_ON_TTL_MS = 3500;
-const MIN_MISSED_SCANS_KEEP = 6;
+const LOCK_ON_TTL_MS = 2500;
+const MAX_MISSED_SCANS = 4;
 
 export const CameraView: React.FC<Props> = ({
   checklist,
@@ -56,6 +57,7 @@ export const CameraView: React.FC<Props> = ({
   isRtl,
   onBack,
   onCompleteItem,
+  onCompleteMultipleItems,
   onRestartBatch,
 }) => {
   const videoRef = useRef<HTMLVideoElement | null>(null);
@@ -75,28 +77,27 @@ export const CameraView: React.FC<Props> = ({
   const [hardwareZoomAvailable, setHardwareZoomAvailable] = useState(false);
   const [zoomMinMax, setZoomMinMax] = useState<{ min: number; max: number }>({ min: 1, max: 3 });
 
-  // Auto (~100ms cycle) vs Manual (Tap to scan)
+  // Auto vs Manual (Tap to scan)
   const [scanMode, setScanMode] = useState<'auto' | 'manual'>('auto');
   const [manualScanPulse, setManualScanPulse] = useState(false);
 
-  // OCR Hook (Pre-warmed singleton worker + Full-Frame 1024px canvas + 3500ms persistent lock-on)
+  // Full-Screen 1152px Matrix OCR Hook
   const {
     isInitializing,
-    initStatusText,
-    rawTextPreview,
     lastScanResult,
     scanSource,
     purgeItem,
+    purgeMultipleItems,
   } = useOCRScanner(ocrLanguage, checklist);
 
-  const trackedBoxesRef = useRef<StickyBoxTrack[]>([]);
+  const trackedBoxesRef = useRef<TrackedSpatialBox[]>([]);
   const detectedGroupsRef = useRef<DetectedMatchGroup[]>([]);
-  const scanDimsRef = useRef<{ w: number; h: number }>({ w: 1024, h: 576 });
+  const scanDimsRef = useRef<{ w: number; h: number }>({ w: OCR_MATRIX_WIDTH, h: 648 });
   const activeChecklistRef = useRef<ChecklistItem[]>(checklist);
   activeChecklistRef.current = checklist;
   const completedIdsRef = useRef<Set<string>>(new Set());
 
-  // Keep completedIdsRef synced with active checklist (e.g. if batch restarted)
+  // Keep completedIdsRef synced with active checklist
   useEffect(() => {
     const activeIds = new Set(checklist.map((i) => i.id));
     for (const id of Array.from(completedIdsRef.current)) {
@@ -105,12 +106,11 @@ export const CameraView: React.FC<Props> = ({
       }
     }
     trackedBoxesRef.current = trackedBoxesRef.current.filter(
-      (b) => b.matchedItemId && activeIds.has(b.matchedItemId) && !completedIdsRef.current.has(b.matchedItemId)
+      (b) => activeIds.has(b.targetId) && !completedIdsRef.current.has(b.targetId)
     );
   }, [checklist]);
 
-  // Persistent Lock-On: Match new detections to existing tracked boxes anywhere on screen,
-  // reset missedFrames = 0 & lastSeenTimestamp = now, and hold missed boxes for 3500ms / 6 scans
+  // PHASE 4: Multi-Occurrence Spatial Tracking (tracks every occurrence independently)
   useEffect(() => {
     if (!lastScanResult) return;
 
@@ -124,55 +124,78 @@ export const CameraView: React.FC<Props> = ({
     detectedGroupsRef.current = lastScanResult.detectedGroups.filter((g) =>
       activeIds.has(g.item.id)
     );
-    scanDimsRef.current = {
-      w: lastScanResult.frameWidth,
-      h: lastScanResult.frameHeight,
-    };
+
+    const ocrW = lastScanResult.frameWidth || OCR_MATRIX_WIDTH;
+    const ocrH = lastScanResult.frameHeight || 648;
+    scanDimsRef.current = { w: ocrW, h: ocrH };
+
+    const videoEl = videoRef.current;
+    const rect = videoEl?.getBoundingClientRect();
+    const viewW = rect?.width || window.innerWidth;
+    const viewH = rect?.height || window.innerHeight;
+    const scale = Math.max(viewW / ocrW, viewH / ocrH);
+    const offsetX = (viewW - ocrW * scale) * 0.5;
+    const offsetY = (viewH - ocrH * scale) * 0.5;
 
     const currentTracks = trackedBoxesRef.current.filter(
-      (t) => t.matchedItemId && activeIds.has(t.matchedItemId) && !completedIdsRef.current.has(t.matchedItemId)
+      (t) => activeIds.has(t.targetId) && !completedIdsRef.current.has(t.targetId)
     );
     const incomingWords = lastScanResult.matchedWords.filter(
       (w) => w.matchedItemId && activeIds.has(w.matchedItemId) && !completedIdsRef.current.has(w.matchedItemId)
     );
 
-    // Group incoming words by target item ID (pick highest confidence if multiple tokens matched same item)
-    const incomingByItemId = new Map<string, MatchedWord>();
-    for (const w of incomingWords) {
-      if (!w.matchedItemId) continue;
-      const existing = incomingByItemId.get(w.matchedItemId);
-      if (!existing || w.confidence > existing.confidence) {
-        incomingByItemId.set(w.matchedItemId, w);
-      }
-    }
-
-    const updatedTracks: StickyBoxTrack[] = [];
+    const updatedTracks: TrackedSpatialBox[] = [];
     const matchedPrevIndices = new Set<number>();
 
-    for (const [itemId, m] of incomingByItemId.entries()) {
-      // Match to existing tracked box for this target item anywhere on screen
-      const prevIdx = currentTracks.findIndex(
-        (p, idx) => !matchedPrevIndices.has(idx) && p.matchedItemId === itemId
-      );
+    for (let i = 0; i < incomingWords.length; i++) {
+      const m = incomingWords[i];
+      const targetId = m.matchedItemId!;
 
-      if (prevIdx >= 0) {
-        matchedPrevIndices.add(prevIdx);
-        const prev = currentTracks[prevIdx];
+      // Screen-space coordinates for spatial instance ID
+      const boxX = m.bbox.x0 * scale + offsetX;
+      const boxY = m.bbox.y0 * scale + offsetY;
+      const spatialId = `${targetId}_${Math.round(boxX / 60)}_${Math.round(boxY / 60)}`;
+
+      const mCx = (m.bbox.x0 + m.bbox.x1) * 0.5;
+      const mCy = (m.bbox.y0 + m.bbox.y1) * 0.5;
+
+      // Associate with nearest existing spatial instance of the same target item (< 100px in OCR space)
+      let bestPrevIdx = -1;
+      let bestDist = 100;
+
+      for (let j = 0; j < currentTracks.length; j++) {
+        if (matchedPrevIndices.has(j)) continue;
+        const p = currentTracks[j];
+        if (p.targetId !== targetId) continue;
+
+        const pCx = (p.bbox.x0 + p.bbox.x1) * 0.5;
+        const pCy = (p.bbox.y0 + p.bbox.y1) * 0.5;
+        const dist = Math.hypot(mCx - pCx, mCy - pCy);
+        if (dist < bestDist) {
+          bestDist = dist;
+          bestPrevIdx = j;
+        }
+      }
+
+      if (bestPrevIdx >= 0) {
+        matchedPrevIndices.add(bestPrevIdx);
+        const prev = currentTracks[bestPrevIdx];
         updatedTracks.push({
           ...prev,
+          spatialId,
           bbox: m.bbox,
           lastSeenTimestamp: now,
           missedFrames: 0,
         });
       } else {
         updatedTracks.push({
-          key: `lock-${itemId}`,
-          matchedItemId: itemId,
+          spatialId,
+          targetId,
           bbox: m.bbox,
-          x: 0,
-          y: 0,
-          w: 0,
-          h: 0,
+          renderX: 0,
+          renderY: 0,
+          renderW: 0,
+          renderH: 0,
           lastSeenTimestamp: now,
           missedFrames: 0,
           initialized: false,
@@ -180,16 +203,16 @@ export const CameraView: React.FC<Props> = ({
       }
     }
 
-    // Never clear on single-frame OCR drops: keep existing boxes alive for 3500ms OR at least 6 missed OCR scans
+    // Keep detected boxes locked on for up to 2500ms (or 4 missed scans)
     for (let j = 0; j < currentTracks.length; j++) {
       if (matchedPrevIndices.has(j)) continue;
       const p = currentTracks[j];
       const nextMissed = p.missedFrames + 1;
       if (
-        p.matchedItemId &&
-        activeIds.has(p.matchedItemId) &&
-        !completedIdsRef.current.has(p.matchedItemId) &&
-        (now - p.lastSeenTimestamp < LOCK_ON_TTL_MS || nextMissed <= MIN_MISSED_SCANS_KEEP)
+        activeIds.has(p.targetId) &&
+        !completedIdsRef.current.has(p.targetId) &&
+        now - p.lastSeenTimestamp < LOCK_ON_TTL_MS &&
+        nextMissed <= MAX_MISSED_SCANS
       ) {
         updatedTracks.push({
           ...p,
@@ -231,7 +254,7 @@ export const CameraView: React.FC<Props> = ({
     };
   }, [stopTracks]);
 
-  // Initialize Full HD 1080p Camera Stream (1920x1080 @ 30fps) for crisp distant text
+  // Initialize Full HD 1080p Camera Stream (1920x1080 @ 30fps)
   const initCamera = useCallback(async () => {
     setCameraError(null);
     stopTracks();
@@ -244,7 +267,7 @@ export const CameraView: React.FC<Props> = ({
           width: { ideal: 1920 },
           height: { ideal: 1080 },
           frameRate: { ideal: 30 },
-          // @ts-expect-error continuous focus and exposure modes keep distant text sharp
+          // @ts-expect-error continuous focus and exposure modes keep text sharp
           advanced: [{ focusMode: 'continuous' }, { exposureMode: 'continuous' }],
         },
       };
@@ -257,11 +280,12 @@ export const CameraView: React.FC<Props> = ({
         await videoRef.current.play();
       }
 
-      // Check capabilities for Torch & Hardware Zoom
       const videoTrack = stream.getVideoTracks()[0];
       if (videoTrack) {
         const trackWithCaps = videoTrack as MediaStreamTrack & { getCapabilities?: () => unknown };
-        const capabilities = (typeof trackWithCaps.getCapabilities === 'function' ? trackWithCaps.getCapabilities() : {}) as {
+        const capabilities = (typeof trackWithCaps.getCapabilities === 'function'
+          ? trackWithCaps.getCapabilities()
+          : {}) as {
           torch?: boolean;
           zoom?: { min: number; max: number; step: number };
         };
@@ -368,61 +392,77 @@ export const CameraView: React.FC<Props> = ({
     }
   }, [isInitializing, matchMode, scanSource]);
 
-  // Fast Full-Frame 1024px OCR Loop (~100ms cycle)
+  // Adaptive Zero-Delay Async OCR Loop (`while (active) { await scanOnce(); }`)
   useEffect(() => {
     if (scanMode !== 'auto' || isInitializing) return;
 
-    const intervalId = setInterval(() => {
-      const video = videoRef.current;
-      const currentItems = activeChecklistRef.current.filter(
-        (i) => !completedIdsRef.current.has(i.id)
-      );
+    let isRunning = true;
 
-      if (video && currentItems.length > 0) {
-        if (video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA && video.videoWidth > 0) {
-          void scanSource(video, currentItems, matchMode, true, true);
+    const runAdaptiveLoop = async () => {
+      while (isRunning) {
+        const video = videoRef.current;
+        const currentItems = activeChecklistRef.current.filter(
+          (i) => !completedIdsRef.current.has(i.id)
+        );
+
+        if (
+          video &&
+          currentItems.length > 0 &&
+          video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA &&
+          video.videoWidth > 0
+        ) {
+          await scanSource(video, currentItems, matchMode, true, true);
+          // Brief 16ms frame yield so the 60fps UI thread stays silky smooth
+          await new Promise((r) => setTimeout(r, 16));
+        } else {
+          await new Promise((r) => setTimeout(r, 50));
         }
       }
-    }, 90);
+    };
+
+    void runAdaptiveLoop();
 
     return () => {
-      clearInterval(intervalId);
+      isRunning = false;
     };
   }, [isInitializing, scanSource, matchMode, scanMode]);
 
-  // Persistent Lock-On 60fps Green Pill Box Renderer (3500ms TTL + 6 missed scans + 0.35 lerp + 100% solid opacity)
+  // PHASE 3: Zero-Offset Pixel-Locked Coordinate Mapping & Instant Snap Renderer
   useEffect(() => {
     let animId: number;
 
     const render = () => {
       const canvas = canvasRef.current;
-      const container = containerRef.current;
-      const video = videoRef.current;
+      const videoEl = videoRef.current;
 
-      if (canvas && container && video) {
-        const rect = canvas.getBoundingClientRect();
-        const screenW = Math.round(rect.width || canvas.clientWidth || container.clientWidth);
-        const screenH = Math.round(rect.height || canvas.clientHeight || container.clientHeight);
+      if (canvas && videoEl) {
+        // 1. Sync <canvas> dimensions & position to exact <video> client rect
+        const rect = videoEl.getBoundingClientRect();
+        const viewW = rect.width;
+        const viewH = rect.height;
+        const dpr = window.devicePixelRatio || 1;
 
-        if (canvas.width !== screenW || canvas.height !== screenH) {
-          canvas.width = screenW;
-          canvas.height = screenH;
+        const targetW = Math.round(viewW * dpr);
+        const targetH = Math.round(viewH * dpr);
+
+        if (canvas.width !== targetW || canvas.height !== targetH) {
+          canvas.width = targetW;
+          canvas.height = targetH;
         }
 
         const ctx = canvas.getContext('2d');
         if (ctx) {
-          ctx.clearRect(0, 0, screenW, screenH);
+          ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+          ctx.clearRect(0, 0, viewW, viewH);
 
           const ocrW = scanDimsRef.current.w;
           const ocrH = scanDimsRef.current.h;
 
-          if (ocrW > 0 && ocrH > 0 && screenW > 0 && screenH > 0) {
-            const effectiveZoom = !hardwareZoomAvailable && zoomLevel > 1 ? zoomLevel : 1;
-            const scale = Math.max(screenW / ocrW, screenH / ocrH) * effectiveZoom;
-            const renderedW = ocrW * scale;
-            const renderedH = ocrH * scale;
-            const offsetX = (screenW - renderedW) / 2;
-            const offsetY = (screenH - renderedH) / 2;
+          if (ocrW > 0 && ocrH > 0 && viewW > 0 && viewH > 0) {
+            // 2. Exact object-fit: cover transformation
+            const scale = Math.max(viewW / ocrW, viewH / ocrH);
+            const offsetX = (viewW - ocrW * scale) / 2;
+            const offsetY = (viewH - ocrH * scale) / 2;
 
             const now = performance.now();
             const liveActiveIds = new Set(
@@ -431,53 +471,59 @@ export const CameraView: React.FC<Props> = ({
                 .map((i) => i.id)
             );
 
-            // Keep locked-on boxes alive for 3500ms OR at least 6 missed OCR scans (unless marked Done)
+            // Prune expired tracks (> 2500ms or > 4 missed scans) and completed items
             const activeTracks = trackedBoxesRef.current.filter(
               (tr) =>
-                (now - tr.lastSeenTimestamp < LOCK_ON_TTL_MS ||
-                  tr.missedFrames <= MIN_MISSED_SCANS_KEEP) &&
-                tr.matchedItemId &&
-                liveActiveIds.has(tr.matchedItemId) &&
-                !completedIdsRef.current.has(tr.matchedItemId)
+                now - tr.lastSeenTimestamp < LOCK_ON_TTL_MS &&
+                tr.missedFrames <= MAX_MISSED_SCANS &&
+                liveActiveIds.has(tr.targetId) &&
+                !completedIdsRef.current.has(tr.targetId)
             );
             trackedBoxesRef.current = activeTracks;
 
             for (let i = 0; i < activeTracks.length; i++) {
               const tr = activeTracks[i];
-              let screenX = tr.bbox.x0 * scale + offsetX;
-              const screenY = tr.bbox.y0 * scale + offsetY;
-              const screenBoxW = (tr.bbox.x1 - tr.bbox.x0) * scale;
-              const screenBoxH = (tr.bbox.y1 - tr.bbox.y0) * scale;
+              let boxX = tr.bbox.x0 * scale + offsetX;
+              const boxY = tr.bbox.y0 * scale + offsetY;
+              const boxW = (tr.bbox.x1 - tr.bbox.x0) * scale;
+              const boxH = (tr.bbox.y1 - tr.bbox.y0) * scale;
 
               if (isFrontCamera) {
-                screenX = screenW - (screenX + screenBoxW);
+                boxX = viewW - (boxX + boxW);
               }
 
+              // 3. Instant Snap on First Detection (or large >100px jump); lerp=0.55 for <100px motion
               if (!tr.initialized) {
-                tr.x = screenX;
-                tr.y = screenY;
-                tr.w = screenBoxW;
-                tr.h = screenBoxH;
+                tr.renderX = boxX;
+                tr.renderY = boxY;
+                tr.renderW = boxW;
+                tr.renderH = boxH;
                 tr.initialized = true;
               } else {
-                // Smoothly glide (lerp factor 0.35 per 60fps animation frame) to updated coordinates
-                const lerp = 0.35;
-                tr.x += (screenX - tr.x) * lerp;
-                tr.y += (screenY - tr.y) * lerp;
-                tr.w += (screenBoxW - tr.w) * lerp;
-                tr.h += (screenBoxH - tr.h) * lerp;
+                const moveDist = Math.hypot(boxX - tr.renderX, boxY - tr.renderY);
+                if (moveDist >= 100) {
+                  tr.renderX = boxX;
+                  tr.renderY = boxY;
+                  tr.renderW = boxW;
+                  tr.renderH = boxH;
+                } else {
+                  const lerp = 0.55;
+                  tr.renderX += (boxX - tr.renderX) * lerp;
+                  tr.renderY += (boxY - tr.renderY) * lerp;
+                  tr.renderW += (boxW - tr.renderW) * lerp;
+                  tr.renderH += (boxH - tr.renderH) * lerp;
+                }
               }
 
-              // Tight green pill box geometry
+              // Clean green pill box geometry (zero text labels inside/above box)
               const padX = 4;
               const padY = 2;
-              const rx = tr.x - padX;
-              const ry = tr.y - padY;
-              const rw = tr.w + padX * 2;
-              const rh = tr.h + padY * 2;
+              const rx = tr.renderX - padX;
+              const ry = tr.renderY - padY;
+              const rw = tr.renderW + padX * 2;
+              const rh = tr.renderH + padY * 2;
               const pillRadius = Math.min(8, Math.max(4, rh * 0.32));
 
-              // Solid, unblinking 100% full opacity the entire time the box is locked on
               ctx.save();
               ctx.globalAlpha = 1;
               ctx.shadowColor = '#22c55e';
@@ -505,31 +551,65 @@ export const CameraView: React.FC<Props> = ({
     return () => {
       cancelAnimationFrame(animId);
     };
-  }, [isFrontCamera, hardwareZoomAvailable, zoomLevel]);
+  }, [isFrontCamera]);
 
-  // Handle "✓ Done" button action on a found item — immediately purges OCR memory & tracked boxes
+  // Handle single item "✓" completion
   const handleMarkItemDone = (item: ChecklistItem) => {
     triggerHaptic(60);
 
-    // 1. Tombstone immediately so neither the 60fps canvas nor in-flight OCR jobs can resurrect it
     completedIdsRef.current.add(item.id);
     purgeItem(item.id);
 
-    // 2. Purge from local tracked boxes & groups refs
     trackedBoxesRef.current = trackedBoxesRef.current.filter(
-      (b) => b.matchedItemId !== item.id
+      (b) => b.targetId !== item.id
     );
     detectedGroupsRef.current = detectedGroupsRef.current.filter(
       (g) => g.item.id !== item.id
     );
 
-    // 3. Show completion toast & update parent state
     setSuccessToast(t.completedToast(item.text));
     setTimeout(() => {
       setSuccessToast(null);
     }, 1800);
 
     onCompleteItem(item);
+  };
+
+  // Handle "Mark All Found (✓)" batch completion
+  const handleMarkAllFound = (groups: DetectedMatchGroup[]) => {
+    if (groups.length === 0) return;
+    triggerHaptic(80);
+
+    const itemsToComplete = groups.map((g) => g.item);
+    const idsToPurge = itemsToComplete.map((i) => i.id);
+
+    for (const id of idsToPurge) {
+      completedIdsRef.current.add(id);
+    }
+    purgeMultipleItems(idsToPurge);
+
+    const purgeSet = new Set(idsToPurge);
+    trackedBoxesRef.current = trackedBoxesRef.current.filter(
+      (b) => !purgeSet.has(b.targetId)
+    );
+    detectedGroupsRef.current = [];
+
+    const summaryText =
+      itemsToComplete.length === 1
+        ? t.completedToast(itemsToComplete[0].text)
+        : `✓ ${itemsToComplete.length} items marked done`;
+    setSuccessToast(summaryText);
+    setTimeout(() => {
+      setSuccessToast(null);
+    }, 1800);
+
+    if (onCompleteMultipleItems) {
+      onCompleteMultipleItems(itemsToComplete);
+    } else {
+      for (const item of itemsToComplete) {
+        onCompleteItem(item);
+      }
+    }
   };
 
   const handleExit = () => {
@@ -545,12 +625,15 @@ export const CameraView: React.FC<Props> = ({
   );
   const isAllCompleted = checklist.length === 0 && totalCount > 0;
 
-  // If all items completed, stop camera tracks immediately
   useEffect(() => {
     if (isAllCompleted) {
       stopTracks();
     }
   }, [isAllCompleted, stopTracks]);
+
+  const zoomTransform = !hardwareZoomAvailable && zoomLevel > 1 ? `scale(${zoomLevel})` : '';
+  const mirrorTransform = isFrontCamera ? 'scaleX(-1)' : '';
+  const sharedTransform = `${mirrorTransform} ${zoomTransform}`.trim();
 
   return (
     <div
@@ -561,26 +644,30 @@ export const CameraView: React.FC<Props> = ({
       }`}
       dir="ltr"
     >
-      {/* Full-Screen Edge-to-Edge Camera View with digital zoom transform fallback */}
+      {/* Full-Screen Edge-to-Edge Camera View */}
       <video
         ref={videoRef}
         autoPlay
         playsInline
         muted
         style={{
-          transform: `${isFrontCamera ? 'scaleX(-1)' : ''} ${!hardwareZoomAvailable && zoomLevel > 1 ? `scale(${zoomLevel})` : ''}`,
+          transform: sharedTransform || undefined,
           transformOrigin: 'center center',
         }}
         className="absolute inset-0 w-full h-full object-cover transition-transform duration-200"
       />
 
-      {/* Transparent 60fps Full-Screen Canvas Overlay */}
+      {/* Retina-Synced 60fps Full-Screen Canvas Overlay (shares exact transform with videoEl) */}
       <canvas
         ref={canvasRef}
-        className="absolute inset-0 w-full h-full pointer-events-none z-10"
+        style={{
+          transform: sharedTransform || undefined,
+          transformOrigin: 'center center',
+        }}
+        className="absolute inset-0 w-full h-full pointer-events-none z-10 transition-transform duration-200"
       />
 
-      {/* 1. TOP MINIMALIST GEOMETRIC BAR (Pushed comfortably down to top-20, clear of Dynamic Island) */}
+      {/* 1. TOP MINIMALIST GEOMETRIC BAR (No live raw-text debug bar below it!) */}
       <div className="absolute top-20 inset-x-0 z-30 px-4 flex flex-col items-center gap-2 pointer-events-auto max-w-md mx-auto">
         <div className="w-full h-12 px-3 bg-white/95 dark:bg-[#0f0f0f]/95 backdrop-blur-md border border-[#cbd5e1] dark:border-white/75 flex items-center justify-between gap-2 shadow-lg">
           {/* Back Button */}
@@ -657,16 +744,6 @@ export const CameraView: React.FC<Props> = ({
           </div>
         </div>
 
-        {/* Live OCR Debug / Raw Detected Text Preview Bar */}
-        <div
-          className="w-full px-3 py-1.5 bg-white/90 dark:bg-[#0f0f0f]/90 backdrop-blur-md border border-[#cbd5e1] dark:border-white/50 text-[11px] text-[#0f172a] dark:text-neutral-200 flex items-center justify-between gap-2"
-          dir={isRtl ? 'rtl' : 'ltr'}
-        >
-          <span className="font-mono truncate w-full">
-            {rawTextPreview ? `${t.cameraSees}: "${rawTextPreview}"` : initStatusText}
-          </span>
-        </div>
-
         {/* Success Toast */}
         {successToast && (
           <div className="w-full px-4 py-2 bg-[#248a3d] text-white font-bold text-xs border border-white/50 shadow-lg flex items-center justify-center gap-2 z-40">
@@ -714,40 +791,50 @@ export const CameraView: React.FC<Props> = ({
         )}
       </div>
 
-      {/* 2. BOTTOM AREA: Match Cards + 1x/2x/3x Distance Zoom Bar */}
-      <div className="absolute bottom-0 inset-x-0 z-30 pb-[max(env(safe-area-inset-bottom,16px),24px)] px-4 pt-4 flex flex-col items-center gap-3 pointer-events-auto max-w-md mx-auto">
-        {/* MATCHED ITEM POPUP BOX (Appears immediately whenever item detected) */}
+      {/* 2. BOTTOM AREA: Compact Horizontal Multi-Match Chips + "Mark All Found (✓)" + 1x/2x/3x Zoom Bar */}
+      <div className="absolute bottom-0 inset-x-0 z-30 pb-[max(env(safe-area-inset-bottom,16px),24px)] px-4 pt-4 flex flex-col items-center gap-2.5 pointer-events-auto max-w-md mx-auto">
         {detectedGroups.length > 0 && !showQueueDropdown && (
           <div
-            className="w-full flex flex-col gap-2"
+            className="w-full bg-white/95 dark:bg-[#0f0f0f]/95 backdrop-blur-md border-2 border-[#22c55e] p-2.5 shadow-2xl flex flex-col gap-2"
             dir={isRtl ? 'rtl' : 'ltr'}
           >
-            {detectedGroups.map((group) => (
-              <div
-                key={group.item.id}
-                className="flex items-center justify-between gap-3 px-4 py-3 bg-white/95 dark:bg-[#0f0f0f]/95 backdrop-blur-md border-2 border-[#22c55e] shadow-2xl"
-              >
-                <div className="min-w-0 flex-1 flex items-center gap-2.5">
-                  <Check className="w-5 h-5 text-[#22c55e] stroke-[3] shrink-0" />
-                  <div className="min-w-0">
-                    <h4 className="text-sm font-extrabold text-[#0f172a] dark:text-white truncate">
-                      {group.item.text}
-                    </h4>
-                    <span className="text-[10px] text-[#22c55e] font-mono tabular-nums">
-                      {group.primaryWord.confidence}%
-                    </span>
-                  </div>
-                </div>
-
-                <button
-                  onClick={() => handleMarkItemDone(group.item)}
-                  className="px-4 py-2 bg-[#248a3d] hover:bg-[#2aa147] active:scale-95 text-white font-bold text-xs sm:text-sm transition-all flex items-center gap-1.5 shrink-0"
+            {/* Compact Horizontal Chips for all simultaneously detected items */}
+            <div className="flex flex-wrap items-center gap-1.5">
+              {detectedGroups.map((group) => (
+                <div
+                  key={group.item.id}
+                  className="inline-flex items-center gap-2 pl-2.5 pr-1.5 py-1 bg-slate-100 dark:bg-[#161616] border border-[#cbd5e1] dark:border-white/40 text-xs font-extrabold text-[#0f172a] dark:text-white"
                 >
-                  <Check className="w-4 h-4 stroke-[3]" />
-                  <span>{t.doneButton}</span>
-                </button>
-              </div>
-            ))}
+                  <span className="truncate max-w-[140px]" dir="ltr">
+                    {group.item.text}
+                  </span>
+                  {group.words.length > 1 && (
+                    <span className="text-[10px] font-mono text-[#22c55e] tabular-nums">
+                      ×{group.words.length}
+                    </span>
+                  )}
+                  <button
+                    onClick={() => handleMarkItemDone(group.item)}
+                    className="px-2 py-1 bg-[#248a3d] hover:bg-[#2aa147] active:scale-95 text-white font-bold text-[11px] transition flex items-center gap-1 shrink-0"
+                    title={t.doneButton}
+                  >
+                    <Check className="w-3.5 h-3.5 stroke-[3]" />
+                    <span>{t.doneButton}</span>
+                  </button>
+                </div>
+              ))}
+            </div>
+
+            {/* "Mark All Found (✓)" Action Button when multiple items are detected simultaneously */}
+            {detectedGroups.length > 1 && (
+              <button
+                onClick={() => handleMarkAllFound(detectedGroups)}
+                className="w-full py-2 px-3 bg-[#248a3d] hover:bg-[#2aa147] active:scale-98 text-white font-extrabold text-xs border border-white/30 transition flex items-center justify-center gap-1.5"
+              >
+                <CheckCheck className="w-4 h-4 stroke-[2.75]" />
+                <span>Mark All Found ({detectedGroups.length}) ✓</span>
+              </button>
+            )}
           </div>
         )}
 
