@@ -28,6 +28,19 @@ interface Props {
   onRestartBatch: () => void;
 }
 
+interface InterpolatedBox {
+  key: string;
+  matchedItemId?: string;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  targetX: number;
+  targetY: number;
+  targetW: number;
+  targetH: number;
+}
+
 export const CameraView: React.FC<Props> = ({
   checklist,
   completedItems,
@@ -57,11 +70,11 @@ export const CameraView: React.FC<Props> = ({
   const [hardwareZoomAvailable, setHardwareZoomAvailable] = useState(false);
   const [zoomMinMax, setZoomMinMax] = useState<{ min: number; max: number }>({ min: 1, max: 3 });
 
-  // Thermal optimization: Auto (cool 900ms throttled) vs Manual (0% idle CPU tap-to-scan)
+  // Auto (~150ms post-scan delay) vs Manual (Tap to scan)
   const [scanMode, setScanMode] = useState<'auto' | 'manual'>('auto');
   const [manualScanPulse, setManualScanPulse] = useState(false);
 
-  // OCR Hook (Tesseract v5 + PSM 11)
+  // OCR Hook (Tesseract v5 + PSM 6 + Raw 1024px canvas)
   const {
     isInitializing,
     initStatusText,
@@ -72,21 +85,23 @@ export const CameraView: React.FC<Props> = ({
     scanSource,
   } = useOCRScanner(ocrLanguage);
 
-  const matchesRef = useRef<MatchedWord[]>([]);
+  const targetBoxesRef = useRef<MatchedWord[]>([]);
+  const interpolatedBoxesRef = useRef<InterpolatedBox[]>([]);
   const detectedGroupsRef = useRef<DetectedMatchGroup[]>([]);
-  const scanDimsRef = useRef<{ w: number; h: number }>({ w: 0, h: 0 });
+  const scanDimsRef = useRef<{ w: number; h: number }>({ w: 1024, h: 576 });
   const activeChecklistRef = useRef<ChecklistItem[]>(checklist);
   activeChecklistRef.current = checklist;
 
+  // Sync latest OCR matched bounding boxes into targetBoxesRef
   useEffect(() => {
-    if (lastScanResult) {
-      matchesRef.current = lastScanResult.matchedWords;
-      detectedGroupsRef.current = lastScanResult.detectedGroups;
-      scanDimsRef.current = {
-        w: lastScanResult.frameWidth,
-        h: lastScanResult.frameHeight,
-      };
-    }
+    if (!lastScanResult) return;
+
+    targetBoxesRef.current = lastScanResult.matchedWords;
+    detectedGroupsRef.current = lastScanResult.detectedGroups;
+    scanDimsRef.current = {
+      w: lastScanResult.frameWidth,
+      h: lastScanResult.frameHeight,
+    };
   }, [lastScanResult]);
 
   // Clean up media tracks immediately to release camera indicator on iOS/Android
@@ -126,7 +141,7 @@ export const CameraView: React.FC<Props> = ({
 
     try {
       const constraints: MediaStreamConstraints = {
-        audio: false, // Strictly no audio recording
+        audio: false,
         video: {
           facingMode: isFrontCamera ? 'user' : { ideal: 'environment' },
           width: { ideal: 1280 },
@@ -218,11 +233,15 @@ export const CameraView: React.FC<Props> = ({
   const flipCamera = () => {
     setIsFrontCamera((prev) => !prev);
     setIsTorchOn(false);
+    targetBoxesRef.current = [];
+    interpolatedBoxesRef.current = [];
   };
 
   // Apply Hardware / Digital Zoom (1x, 2x, 3x)
   const applyZoom = async (level: number) => {
     setZoomLevel(level);
+    targetBoxesRef.current = [];
+    interpolatedBoxesRef.current = [];
     if (!streamRef.current) return;
     const videoTrack = streamRef.current.getVideoTracks()[0];
 
@@ -252,7 +271,7 @@ export const CameraView: React.FC<Props> = ({
     }
   }, [isInitializing, matchMode, scanSource]);
 
-  // Throttled OCR scanning loop (Cool CPU Mode: 900ms between completed frames in auto mode)
+  // Fast, Non-Blocking Tesseract.js Loop (~150ms delay between completed scans)
   useEffect(() => {
     let timer: NodeJS.Timeout;
     let isCancelled = false;
@@ -269,13 +288,12 @@ export const CameraView: React.FC<Props> = ({
       }
 
       if (!isCancelled && scanMode === 'auto') {
-        // 900ms cool interval stops mobile CPU thermal throttling
-        timer = setTimeout(runLoop, 900);
+        timer = setTimeout(runLoop, 150);
       }
     };
 
     if (scanMode === 'auto') {
-      timer = setTimeout(runLoop, 400);
+      timer = setTimeout(runLoop, 150);
     }
 
     return () => {
@@ -284,7 +302,7 @@ export const CameraView: React.FC<Props> = ({
     };
   }, [isInitializing, scanSource, matchMode, scanMode]);
 
-  // 60 FPS Word-Level Bounding Box Renderer with exact object-fit: cover coordinate mapping
+  // Smooth 60fps Box Rendering (Pure Coordinate Interpolation — Zero Pixel Loops)
   useEffect(() => {
     let animId: number;
 
@@ -312,54 +330,94 @@ export const CameraView: React.FC<Props> = ({
           ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
           ctx.clearRect(0, 0, screenW, screenH);
 
-          const srcW = scanDimsRef.current.w || video.videoWidth;
-          const srcH = scanDimsRef.current.h || video.videoHeight;
+          const srcW = scanDimsRef.current.w;
+          const srcH = scanDimsRef.current.h;
 
           if (srcW > 0 && srcH > 0 && screenW > 0 && screenH > 0) {
             const effectiveZoom = !hardwareZoomAvailable && zoomLevel > 1 ? zoomLevel : 1;
             const scale = Math.max(screenW / srcW, screenH / srcH) * effectiveZoom;
-            const renderedW = srcW * scale;
-            const renderedH = srcH * scale;
-            const offsetX = (screenW - renderedW) / 2;
-            const offsetY = (screenH - renderedH) / 2;
+            const offsetX = (screenW - srcW * scale) / 2;
+            const offsetY = (screenH - srcH * scale) / 2;
 
-            const matches = matchesRef.current;
-            const time = performance.now() * 0.003;
+            const rawTargets = targetBoxesRef.current;
+            const currentInterp = interpolatedBoxesRef.current;
+            const nextInterp: InterpolatedBox[] = [];
 
-            for (let i = 0; i < matches.length; i++) {
-              const m = matches[i];
-              let boxX = m.bbox.x0 * scale + offsetX;
-              const boxY = m.bbox.y0 * scale + offsetY;
-              const boxW = (m.bbox.x1 - m.bbox.x0) * scale;
-              const boxH = (m.bbox.y1 - m.bbox.y0) * scale;
+            for (let i = 0; i < rawTargets.length; i++) {
+              const m = rawTargets[i];
+              let tx = m.bbox.x0 * scale + offsetX;
+              const ty = m.bbox.y0 * scale + offsetY;
+              const tw = (m.bbox.x1 - m.bbox.x0) * scale;
+              const th = (m.bbox.y1 - m.bbox.y0) * scale;
 
               if (isFrontCamera) {
-                boxX = screenW - (boxX + boxW);
+                tx = screenW - (tx + tw);
               }
 
-              // Tight padding around the exact matched word (never overlapping surrounding lines)
-              const padX = 3;
-              const padY = 2;
-              const rx = boxX - padX;
-              const ry = boxY - padY;
-              const rw = boxW + padX * 2;
-              const rh = boxH + padY * 2;
+              // Find closest previously interpolated box for smooth 60fps transition
+              const prev = currentInterp.find(
+                (p) =>
+                  p.matchedItemId === m.matchedItemId &&
+                  Math.hypot(p.targetX - tx, p.targetY - ty) < 120
+              );
+
+              if (prev) {
+                const lerp = 0.35;
+                nextInterp.push({
+                  key: prev.key,
+                  matchedItemId: m.matchedItemId,
+                  x: prev.x + (tx - prev.x) * lerp,
+                  y: prev.y + (ty - prev.y) * lerp,
+                  w: prev.w + (tw - prev.w) * lerp,
+                  h: prev.h + (th - prev.h) * lerp,
+                  targetX: tx,
+                  targetY: ty,
+                  targetW: tw,
+                  targetH: th,
+                });
+              } else {
+                nextInterp.push({
+                  key: m.id,
+                  matchedItemId: m.matchedItemId,
+                  x: tx,
+                  y: ty,
+                  w: tw,
+                  h: th,
+                  targetX: tx,
+                  targetY: ty,
+                  targetW: tw,
+                  targetH: th,
+                });
+              }
+            }
+
+            interpolatedBoxesRef.current = nextInterp;
+            const time = performance.now() * 0.003;
+
+            for (let i = 0; i < nextInterp.length; i++) {
+              const b = nextInterp[i];
+              const padX = 4;
+              const padY = 3;
+              const rx = b.x - padX;
+              const ry = b.y - padY;
+              const rw = b.w + padX * 2;
+              const rh = b.h + padY * 2;
 
               const pulse = 0.9 + Math.sin(time * 3.5 + i) * 0.1;
 
               ctx.save();
-              ctx.shadowColor = '#10b981';
+              ctx.shadowColor = '#22c55e';
               ctx.shadowBlur = 10 * pulse;
 
-              // Subtle translucent emerald highlight fill so the text underneath stays 100% readable
-              ctx.fillStyle = `rgba(16, 185, 129, ${0.18 * pulse})`;
+              // Subtle translucent green fill
+              ctx.fillStyle = `rgba(34, 197, 94, ${0.2 * pulse})`;
               ctx.beginPath();
-              ctx.roundRect(rx, ry, rw, rh, 4);
+              ctx.roundRect(rx, ry, rw, rh, 2);
               ctx.fill();
 
-              // Crisp glowing border stroke around ONLY the word
-              ctx.strokeStyle = `rgba(52, 211, 153, ${0.95 * pulse})`;
-              ctx.lineWidth = 2;
+              // Crisp glowing border stroke
+              ctx.strokeStyle = `rgba(34, 197, 94, ${0.95 * pulse})`;
+              ctx.lineWidth = 2.2;
               ctx.stroke();
 
               ctx.restore();
@@ -386,7 +444,10 @@ export const CameraView: React.FC<Props> = ({
       setSuccessToast(null);
     }, 1800);
 
-    matchesRef.current = matchesRef.current.filter((w) => w.matchedItemId !== item.id);
+    targetBoxesRef.current = targetBoxesRef.current.filter((w) => w.matchedItemId !== item.id);
+    interpolatedBoxesRef.current = interpolatedBoxesRef.current.filter(
+      (b) => b.matchedItemId !== item.id
+    );
     detectedGroupsRef.current = detectedGroupsRef.current.filter((g) => g.item.id !== item.id);
 
     onCompleteItem(item);
@@ -414,7 +475,7 @@ export const CameraView: React.FC<Props> = ({
       ref={containerRef}
       onClick={scanMode === 'manual' ? triggerManualScan : undefined}
       className={`fixed inset-0 w-screen h-[100dvh] overflow-hidden bg-black select-none touch-none transition-all duration-300 ${
-        manualScanPulse ? 'ring-4 ring-inset ring-amber-400/60' : ''
+        manualScanPulse ? 'ring-4 ring-inset ring-[#22c55e]/70' : ''
       }`}
       dir="ltr"
     >
@@ -437,102 +498,97 @@ export const CameraView: React.FC<Props> = ({
         className="absolute inset-0 w-full h-full pointer-events-none z-10"
       />
 
-      {/* 1. TOP FLOATING PILL BAR (Pushed comfortably down to top-20, clear of Dynamic Island) */}
-      <div className="absolute top-20 inset-x-0 z-30 px-3 flex flex-col items-center gap-1.5 pointer-events-auto">
-        <div className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-full ios-glass shadow-lg">
+      {/* 1. TOP MINIMALIST GEOMETRIC BAR (Pushed comfortably down to top-20, clear of Dynamic Island) */}
+      <div className="absolute top-20 inset-x-0 z-30 px-4 flex flex-col items-center gap-2 pointer-events-auto max-w-md mx-auto">
+        <div className="w-full h-12 px-3 bg-white/95 dark:bg-[#0f0f0f]/95 backdrop-blur-md border border-[#cbd5e1] dark:border-white/75 flex items-center justify-between gap-2 shadow-lg">
           {/* Back Button */}
           <button
             onClick={handleExit}
-            className="p-1 rounded-full text-slate-300 hover:text-white active:scale-95 transition"
+            className="min-w-[38px] min-h-[38px] flex items-center justify-center text-[#0f172a] dark:text-white hover:opacity-75 active:scale-95 transition"
             aria-label="Back"
           >
-            <ArrowLeft className="w-4 h-4 text-cyan-400" />
+            <ArrowLeft className="w-5 h-5 stroke-[2.5]" />
           </button>
 
-          {/* Remaining Items Pill */}
+          {/* Remaining Items Queue Trigger */}
           <button
             onClick={() => setShowQueueDropdown((prev) => !prev)}
-            className="flex items-center gap-1 px-2 py-0.5 rounded-full bg-white/10 hover:bg-white/15 text-white text-xs font-semibold active:scale-95 transition"
+            className="flex items-center gap-1.5 px-2.5 py-1 bg-slate-100 dark:bg-[#1a1a1a] border border-[#cbd5e1] dark:border-white/30 text-[#0f172a] dark:text-white text-xs font-bold active:scale-95 transition tabular-nums"
             dir={isRtl ? 'rtl' : 'ltr'}
           >
             <span>{t.remainingItems}: {remainingCount}</span>
             <ChevronDown
-              className={`w-3 h-3 text-slate-400 transition-transform ${
+              className={`w-3.5 h-3.5 transition-transform ${
                 showQueueDropdown ? 'rotate-180' : ''
               }`}
             />
           </button>
 
-          {/* Thermal Optimization Mode: Auto (Cool 900ms) vs Tap (0% idle CPU) */}
-          <div className="flex items-center rounded-full bg-black/40 p-0.5 text-[10px] font-semibold border border-white/10">
+          {/* Scan Mode: Auto vs Tap */}
+          <div className="flex items-center bg-slate-100 dark:bg-[#0a0a0a] p-0.5 text-[11px] font-bold border border-[#cbd5e1] dark:border-white/50">
             <button
               onClick={() => setScanMode('auto')}
-              className={`px-2 py-0.5 rounded-full transition active:scale-95 ${
+              className={`px-2 py-1 transition active:scale-95 ${
                 scanMode === 'auto'
-                  ? 'bg-cyan-500 text-slate-950 font-bold shadow-sm'
-                  : 'text-slate-400 hover:text-white'
+                  ? 'bg-[#248a3d] text-white'
+                  : 'text-slate-600 dark:text-neutral-400'
               }`}
             >
-              {t.autoScan}
+              Auto
             </button>
             <button
               onClick={() => setScanMode('manual')}
-              className={`px-2 py-0.5 rounded-full transition active:scale-95 ${
+              className={`px-2 py-1 transition active:scale-95 ${
                 scanMode === 'manual'
-                  ? 'bg-amber-400 text-slate-950 font-bold shadow-sm'
-                  : 'text-slate-400 hover:text-white'
+                  ? 'bg-[#248a3d] text-white'
+                  : 'text-slate-600 dark:text-neutral-400'
               }`}
             >
-              {t.tapToScan}
+              Tap
             </button>
           </div>
 
-          {/* Torch Button */}
-          {torchAvailable && (
-            <button
-              onClick={toggleTorch}
-              className={`p-1 rounded-full transition ${
-                isTorchOn ? 'text-amber-400' : 'text-slate-400 hover:text-white'
-              }`}
-              aria-label="Torch"
-            >
-              {isTorchOn ? <Zap className="w-3.5 h-3.5 fill-current" /> : <ZapOff className="w-3.5 h-3.5" />}
-            </button>
-          )}
+          <div className="flex items-center gap-1">
+            {/* Torch Button */}
+            {torchAvailable && (
+              <button
+                onClick={toggleTorch}
+                className={`min-w-[36px] min-h-[36px] flex items-center justify-center transition ${
+                  isTorchOn
+                    ? 'text-amber-500'
+                    : 'text-slate-600 dark:text-neutral-300 hover:opacity-80'
+                }`}
+                aria-label="Torch"
+              >
+                {isTorchOn ? <Zap className="w-4 h-4 fill-current" /> : <ZapOff className="w-4 h-4" />}
+              </button>
+            )}
 
-          {/* Flip Camera */}
-          <button
-            onClick={flipCamera}
-            className="p-1 rounded-full text-slate-400 hover:text-white transition active:rotate-180 duration-300"
-            aria-label="Flip"
-          >
-            <RefreshCw className="w-3.5 h-3.5" />
-          </button>
+            {/* Flip Camera */}
+            <button
+              onClick={flipCamera}
+              className="min-w-[36px] min-h-[36px] flex items-center justify-center text-slate-600 dark:text-neutral-300 hover:opacity-80 transition active:rotate-180 duration-300"
+              aria-label="Flip"
+            >
+              <RefreshCw className="w-4 h-4" />
+            </button>
+          </div>
         </div>
 
-        {/* Minimal Live OCR Status / Preview Bar */}
+        {/* Live OCR Debug / Raw Detected Text Preview Bar */}
         <div
-          className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full ios-glass-pill text-[10px] text-slate-300 shadow-sm"
+          className="w-full px-3 py-1.5 bg-white/90 dark:bg-[#0f0f0f]/90 backdrop-blur-md border border-[#cbd5e1] dark:border-white/50 text-[11px] text-[#0f172a] dark:text-neutral-200 flex items-center justify-between gap-2"
           dir={isRtl ? 'rtl' : 'ltr'}
         >
-          <span
-            className={`w-1.5 h-1.5 rounded-full ${
-              workerStatus === 'ready'
-                ? isProcessing
-                  ? 'bg-cyan-400 animate-ping'
-                  : 'bg-emerald-400'
-                : 'bg-amber-400'
-            }`}
-          />
-          <span className="font-mono text-cyan-300 truncate max-w-[200px]">
-            {rawTextPreview ? `"${rawTextPreview}"` : initStatusText}
+          <span className="font-mono truncate w-full">
+            {rawTextPreview ? `${t.cameraSees}: "${rawTextPreview}"` : initStatusText}
           </span>
         </div>
 
         {/* Success Toast */}
         {successToast && (
-          <div className="px-3.5 py-1.5 rounded-full bg-emerald-500 text-slate-950 font-bold text-xs shadow-lg animate-bounce flex items-center gap-1.5 z-40 mt-1">
-            <CheckCircle2 className="w-3.5 h-3.5" />
+          <div className="w-full px-4 py-2 bg-[#248a3d] text-white font-bold text-xs border border-white/50 shadow-lg flex items-center justify-center gap-2 z-40">
+            <Check className="w-4 h-4 stroke-[3]" />
             <span>{successToast}</span>
           </div>
         )}
@@ -540,33 +596,34 @@ export const CameraView: React.FC<Props> = ({
         {/* Dropdown for Remaining Items */}
         {showQueueDropdown && (
           <div
-            className="w-full max-w-xs rounded-2xl ios-glass-card p-3 shadow-2xl space-y-2 mt-1 animate-fade-in text-xs text-white"
+            className="w-full bg-white/95 dark:bg-[#0f0f0f]/95 backdrop-blur-md border border-[#cbd5e1] dark:border-white/75 p-3 shadow-2xl space-y-2 text-xs text-[#0f172a] dark:text-white"
             dir={isRtl ? 'rtl' : 'ltr'}
           >
-            <div className="flex items-center justify-between pb-1.5 border-b border-white/10 text-[11px] font-semibold text-slate-300">
+            <div className="flex items-center justify-between pb-2 border-b border-[#cbd5e1] dark:border-white/25 text-xs font-bold">
               <span>{t.activeChecklist} ({checklist.length})</span>
               <button
                 onClick={() => setShowQueueDropdown(false)}
-                className="p-0.5 text-slate-400 hover:text-white"
+                className="p-1 text-slate-500 dark:text-neutral-400 hover:opacity-80"
               >
-                <X className="w-3.5 h-3.5" />
+                <X className="w-4 h-4" />
               </button>
             </div>
 
-            <div className="max-h-36 overflow-y-auto space-y-1.5 pr-1">
+            <div className="max-h-40 overflow-y-auto space-y-2 pr-0.5">
               {checklist.map((item, idx) => (
                 <div
                   key={item.id}
-                  className="flex items-center justify-between gap-2 p-1.5 rounded-lg bg-black/40 border border-white/5"
+                  className="flex items-center justify-between gap-2 px-3 py-2 bg-slate-50 dark:bg-[#0a0a0a] border border-[#cbd5e1] dark:border-white/50"
                 >
-                  <span className="truncate text-[11px] font-medium text-slate-200">
+                  <span className="truncate text-xs font-bold tabular-nums" dir="ltr">
                     {idx + 1}. {item.text}
                   </span>
                   <button
                     onClick={() => handleMarkItemDone(item)}
-                    className="px-2 py-0.5 rounded bg-emerald-500/20 hover:bg-emerald-500 text-emerald-300 hover:text-slate-950 text-[10px] font-bold border border-emerald-500/30 transition active:scale-95"
+                    className="px-2.5 py-1 bg-[#248a3d] hover:bg-[#2aa147] text-white text-[11px] font-bold transition active:scale-95 flex items-center gap-1"
                   >
-                    {t.doneButton}
+                    <Check className="w-3.5 h-3.5 stroke-[3]" />
+                    <span>{t.doneButton}</span>
                   </button>
                 </div>
               ))}
@@ -575,34 +632,34 @@ export const CameraView: React.FC<Props> = ({
         )}
       </div>
 
-      {/* 2. BOTTOM AREA: Match Cards + 1x/2x/3x Distance Zoom Pill (No shutter button) */}
-      <div className="absolute bottom-0 inset-x-0 z-30 pb-[max(env(safe-area-inset-bottom,16px),20px)] p-4 flex flex-col items-center gap-2.5 pointer-events-auto">
-        {/* MATCHED ITEM POPUP CARD (Appears immediately whenever item detected) */}
+      {/* 2. BOTTOM AREA: Match Cards + 1x/2x/3x Distance Zoom Bar */}
+      <div className="absolute bottom-0 inset-x-0 z-30 pb-[max(env(safe-area-inset-bottom,16px),24px)] px-4 pt-4 flex flex-col items-center gap-3 pointer-events-auto max-w-md mx-auto">
+        {/* MATCHED ITEM POPUP BOX (Appears immediately whenever item detected) */}
         {detectedGroups.length > 0 && !showQueueDropdown && (
           <div
-            className="w-full max-w-xs flex flex-col gap-1.5 animate-fade-in"
+            className="w-full flex flex-col gap-2"
             dir={isRtl ? 'rtl' : 'ltr'}
           >
             {detectedGroups.map((group) => (
               <div
                 key={group.item.id}
-                className="flex items-center justify-between gap-2.5 p-3 rounded-2xl ios-glass-card border-2 border-emerald-500 shadow-[0_0_25px_rgba(16,185,129,0.45)] backdrop-blur-xl"
+                className="flex items-center justify-between gap-3 px-4 py-3 bg-white/95 dark:bg-[#0f0f0f]/95 backdrop-blur-md border-2 border-[#22c55e] shadow-2xl"
               >
-                <div className="min-w-0 flex-1">
-                  <div className="flex items-center gap-1.5">
-                    <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
-                    <h4 className="text-sm font-extrabold text-white truncate">
+                <div className="min-w-0 flex-1 flex items-center gap-2.5">
+                  <Check className="w-5 h-5 text-[#22c55e] stroke-[3] shrink-0" />
+                  <div className="min-w-0">
+                    <h4 className="text-sm font-extrabold text-[#0f172a] dark:text-white truncate">
                       {group.item.text}
                     </h4>
+                    <span className="text-[10px] text-[#22c55e] font-mono tabular-nums">
+                      {group.primaryWord.confidence}%
+                    </span>
                   </div>
-                  <span className="text-[10px] text-emerald-400/90 font-mono">
-                    {group.primaryWord.confidence}%
-                  </span>
                 </div>
 
                 <button
                   onClick={() => handleMarkItemDone(group.item)}
-                  className="px-4 py-2 rounded-xl bg-gradient-to-r from-emerald-500 to-teal-400 hover:brightness-110 active:scale-95 text-slate-950 font-black text-xs sm:text-sm shadow-lg shadow-emerald-500/30 transition-all flex items-center gap-1.5 shrink-0"
+                  className="px-4 py-2 bg-[#248a3d] hover:bg-[#2aa147] active:scale-95 text-white font-bold text-xs sm:text-sm transition-all flex items-center gap-1.5 shrink-0"
                 >
                   <Check className="w-4 h-4 stroke-[3]" />
                   <span>{t.doneButton}</span>
@@ -612,55 +669,58 @@ export const CameraView: React.FC<Props> = ({
           </div>
         )}
 
-        {/* Manual Tap-to-Scan Floating Prompt when in manual mode */}
+        {/* Manual Tap-to-Scan Prompt when in manual mode */}
         {scanMode === 'manual' && detectedGroups.length === 0 && (
           <button
             onClick={triggerManualScan}
-            className={`px-3.5 py-1.5 rounded-full ios-glass text-xs font-semibold text-amber-300 border border-amber-400/30 flex items-center gap-1.5 shadow-lg active:scale-95 transition ${
-              manualScanPulse ? 'bg-amber-400/20' : ''
-            }`}
+            className="px-4 py-2 bg-white/95 dark:bg-[#0f0f0f]/95 border border-[#cbd5e1] dark:border-white/75 text-xs font-bold text-[#0f172a] dark:text-white shadow-lg active:scale-95 transition"
           >
-            <span className="w-2 h-2 rounded-full bg-amber-400 animate-ping" />
-            <span>{t.tapScreenToScan}</span>
+            {t.tapScreenToScan}
           </button>
         )}
 
-        {/* Distance Zoom Toggle Pill (1x | 2x | 3x) */}
-        <div className="inline-flex items-center rounded-full ios-glass p-0.5 text-xs font-semibold shadow-md">
-          {[1, 2, 3].map((lvl) => (
-            <button
-              key={lvl}
-              onClick={() => applyZoom(lvl)}
-              className={`px-3 py-1 rounded-full transition active:scale-95 ${
-                zoomLevel === lvl
-                  ? 'bg-white text-slate-950 font-bold shadow-sm'
-                  : 'text-slate-300 hover:text-white'
-              }`}
-            >
-              {lvl}x
-            </button>
+        {/* Minimalist Rectangular Distance Zoom Selector (1x | 2x | 3x) */}
+        <div className="inline-flex items-center bg-white/95 dark:bg-[#0f0f0f]/95 border border-[#cbd5e1] dark:border-white/75 p-1 text-xs font-bold shadow-lg tabular-nums">
+          {[1, 2, 3].map((lvl, idx) => (
+            <React.Fragment key={lvl}>
+              {idx > 0 && (
+                <div className="w-[1px] h-4 bg-[#cbd5e1] dark:bg-white/40 mx-0.5" />
+              )}
+              <button
+                onClick={() => applyZoom(lvl)}
+                className={`px-3.5 py-1 transition active:scale-95 ${
+                  zoomLevel === lvl
+                    ? 'bg-[#248a3d] text-white font-extrabold'
+                    : 'text-[#0f172a] dark:text-white hover:opacity-75'
+                }`}
+              >
+                {lvl}x
+              </button>
+            </React.Fragment>
           ))}
         </div>
       </div>
 
       {/* CAMERA ERROR OVERLAY */}
       {cameraError && (
-        <div className="fixed inset-0 z-40 bg-black/90 backdrop-blur-md p-6 flex flex-col items-center justify-center text-center text-white space-y-3">
-          <h3 className="text-sm font-bold text-white">{t.cameraPermissionDenied}</h3>
-          <p className="text-xs text-slate-400 max-w-xs">{t.cameraErrorInstructions}</p>
-          <div className="flex flex-col gap-2 w-full max-w-xs pt-2">
-            <button
-              onClick={initCamera}
-              className="py-2.5 px-4 rounded-xl bg-cyan-500 text-slate-950 font-bold text-xs"
-            >
-              {t.retryCamera}
-            </button>
-            <button
-              onClick={handleExit}
-              className="py-2 text-xs text-slate-400 hover:text-white"
-            >
-              {t.cameraBack}
-            </button>
+        <div className="fixed inset-0 z-40 bg-[#f8fafc] dark:bg-[#0a0a0a] p-6 flex flex-col items-center justify-center text-center text-[#0f172a] dark:text-white space-y-4">
+          <div className="w-full max-w-xs border border-[#cbd5e1] dark:border-white/75 bg-white dark:bg-[#0f0f0f] p-6 space-y-4">
+            <h3 className="text-base font-extrabold">{t.cameraPermissionDenied}</h3>
+            <p className="text-xs text-slate-500 dark:text-neutral-400">{t.cameraErrorInstructions}</p>
+            <div className="flex flex-col gap-2.5 pt-2">
+              <button
+                onClick={initCamera}
+                className="py-3 px-4 bg-[#248a3d] text-white font-bold text-xs"
+              >
+                {t.retryCamera}
+              </button>
+              <button
+                onClick={handleExit}
+                className="py-2.5 border border-[#cbd5e1] dark:border-white/50 text-xs font-bold"
+              >
+                {t.cameraBack}
+              </button>
+            </div>
           </div>
         </div>
       )}

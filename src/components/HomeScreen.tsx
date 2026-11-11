@@ -1,28 +1,28 @@
 import React, { useState } from 'react';
 import {
-  Plus,
-  Trash2,
-  Camera,
   X,
-  Download,
-  Share2,
-  PlusSquare,
-  Sparkles,
+  Check,
+  Search,
+  Moon,
+  Sun,
+  Globe,
 } from 'lucide-react';
 import { OcrLanguage, UILanguage, ChecklistItem } from '../types';
 import { Translation } from '../translations';
-import { usePWAInstall } from '../hooks/usePWAInstall';
 
 interface Props {
   checklist: ChecklistItem[];
   onAddItem: (text: string) => void;
   onAddMultipleItems: (texts: string[]) => void;
   onRemoveItem: (id: string) => void;
+  onToggleItemCompleted: (id: string) => void;
   onClearAll: () => void;
   ocrLanguage: OcrLanguage;
   setOcrLanguage: (val: OcrLanguage) => void;
   uiLang: UILanguage;
   setUiLang: (val: UILanguage) => void;
+  theme: 'dark' | 'light';
+  onToggleTheme: () => void;
   t: Translation;
   isRtl: boolean;
   onStartScanning: () => void;
@@ -33,18 +33,17 @@ export const HomeScreen: React.FC<Props> = ({
   onAddItem,
   onAddMultipleItems,
   onRemoveItem,
-  onClearAll,
+  onToggleItemCompleted,
   ocrLanguage,
   setOcrLanguage,
   uiLang,
   setUiLang,
-  t,
+  theme,
+  onToggleTheme,
   isRtl,
   onStartScanning,
 }) => {
   const [inputText, setInputText] = useState('');
-  const [showIOSModal, setShowIOSModal] = useState(false);
-  const { isInstallable, isInstalled, isIOS, install } = usePWAInstall();
 
   const handleAddSubmit = (e?: React.FormEvent) => {
     if (e) e.preventDefault();
@@ -66,6 +65,13 @@ export const HomeScreen: React.FC<Props> = ({
     }
   };
 
+  const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      handleAddSubmit();
+    }
+  };
+
   const handlePaste = (e: React.ClipboardEvent<HTMLInputElement>) => {
     const pasted = e.clipboardData.getData('text');
     if (pasted && pasted.includes('\n')) {
@@ -81,243 +87,183 @@ export const HomeScreen: React.FC<Props> = ({
     }
   };
 
-  const handleInstallClick = () => {
-    if (isInstallable) {
-      install();
-    } else if (isIOS) {
-      setShowIOSModal(true);
-    }
+  const handleCycleUiLanguage = () => {
+    setUiLang(uiLang === 'en' ? 'ku' : 'en');
   };
 
   return (
     <div
-      className="w-full h-[100dvh] max-h-[100dvh] overflow-hidden bg-[#07090e] text-slate-100 flex flex-col justify-between p-3 sm:p-4 pt-24 select-none"
+      className="w-full h-[100dvh] max-h-[100dvh] overflow-hidden bg-[#f8fafc] dark:bg-[#0a0a0a] text-[#0f172a] dark:text-white flex flex-col justify-between px-6 pt-20 pb-7 max-w-md mx-auto select-none transition-colors duration-200"
       dir={isRtl ? 'rtl' : 'ltr'}
     >
-      {/* 1. Compact Header with Safe Distance from Dynamic Island */}
-      <header className="shrink-0 flex items-center justify-between gap-2 pb-2">
-        <div className="flex items-center gap-2">
-          <div className="w-7 h-7 rounded-lg bg-gradient-to-tr from-cyan-500 to-emerald-400 flex items-center justify-center shadow-sm">
-            <Camera className="w-4 h-4 text-slate-950 stroke-[2.5]" />
-          </div>
-          <div>
-            <h1 className="text-sm font-bold text-white tracking-tight leading-none">
-              {t.appName}
-            </h1>
-            <p className="text-[10px] text-slate-400 leading-tight mt-0.5">
-              Live OCR Scanner
-            </p>
-          </div>
-        </div>
+      {/* Top & Middle Content Area */}
+      <div className="flex-1 min-h-0 flex flex-col">
+        {/* 1. Header: Square Box + Bold Title */}
+        <header className="shrink-0 flex items-center gap-4 mb-9" dir="ltr">
+          <div className="w-12 h-12 bg-[#d9d9d9] dark:bg-[#d9d9d9] shrink-0" />
+          <h1 className="text-2xl font-extrabold tracking-tight text-[#0f172a] dark:text-white leading-none">
+            {uiLang === 'ku' ? 'گەڕانی دەقی ڕاستەوخۆ' : 'Live Text Finder'}
+          </h1>
+        </header>
 
-        {/* Header Right Actions */}
-        <div className="flex items-center gap-1.5">
-          {!isInstalled && (isInstallable || isIOS) && (
-            <button
-              onClick={handleInstallClick}
-              title="Add to Home Screen"
-              className="p-1.5 rounded-full ios-glass text-cyan-400 hover:text-white transition active:scale-95"
-            >
-              <Download className="w-3.5 h-3.5" />
-            </button>
-          )}
-
-          <div className="flex items-center rounded-full ios-glass p-0.5 text-[11px] font-medium">
-            <button
-              onClick={() => setUiLang('ku')}
-              className={`px-2 py-0.5 rounded-full transition ${
-                uiLang === 'ku'
-                  ? 'bg-cyan-500 text-slate-950 font-bold shadow-sm'
-                  : 'text-slate-400 hover:text-white'
-              }`}
-            >
-              کوردی
-            </button>
-            <button
-              onClick={() => setUiLang('en')}
-              className={`px-2 py-0.5 rounded-full transition ${
-                uiLang === 'en'
-                  ? 'bg-cyan-500 text-slate-950 font-bold shadow-sm'
-                  : 'text-slate-400 hover:text-white'
-              }`}
-            >
-              EN
-            </button>
-          </div>
-        </div>
-      </header>
-
-      {/* 2. Main Body: Input Bar + Active Checklist Area */}
-      <main className="flex-1 min-h-0 flex flex-col gap-2.5 my-1">
-        {/* Sleek Dark-Glass Input Bar */}
-        <form onSubmit={handleAddSubmit} className="shrink-0">
-          <div className="relative flex items-center rounded-xl ios-glass-card p-1 border border-white/10 shadow-sm focus-within:border-cyan-500/50 transition">
+        {/* 2. Target Input Section */}
+        <section className="shrink-0 mb-8">
+          <label
+            htmlFor="target-input"
+            className="block text-sm font-bold mb-2 text-[#0f172a] dark:text-white"
+          >
+            {uiLang === 'ku' ? 'ئامانج بنووسە' : 'Type target'}
+          </label>
+          <form onSubmit={handleAddSubmit}>
             <input
+              id="target-input"
               type="text"
               value={inputText}
               onChange={(e) => setInputText(e.target.value)}
+              onKeyDown={handleKeyDown}
               onPaste={handlePaste}
-              placeholder={t.addPlaceholder}
-              className="flex-1 bg-transparent px-3 py-2 text-xs sm:text-sm text-white placeholder-slate-500 outline-none font-medium"
+              onBlur={() => {
+                if (inputText.trim()) {
+                  handleAddSubmit();
+                }
+              }}
+              placeholder={uiLang === 'ku' ? 'وشە، کۆد........' : 'word, finder........'}
+              enterKeyHint="done"
+              className="w-full h-13 px-4 bg-white dark:bg-[#0f0f0f] border border-[#cbd5e1] dark:border-white/70 rounded-none text-sm font-bold text-[#0f172a] dark:text-white placeholder-[#94a3b8] dark:placeholder-[#3f3f46] outline-none focus:border-[#248a3d] dark:focus:border-white transition-colors"
             />
-            <button
-              type="submit"
-              disabled={!inputText.trim()}
-              className="px-3 py-1.5 rounded-lg bg-gradient-to-r from-cyan-500 to-teal-400 disabled:opacity-30 disabled:pointer-events-none text-slate-950 font-bold text-xs flex items-center gap-1 active:scale-95 transition"
-            >
-              <Plus className="w-3.5 h-3.5 stroke-[3]" />
-              <span className="hidden xs:inline">{t.addItem}</span>
-            </button>
-          </div>
-        </form>
+          </form>
+        </section>
 
-        {/* Active Checklist Container (Scrollable) */}
-        <div className="flex-1 min-h-0 flex flex-col rounded-2xl ios-glass-card p-2.5 sm:p-3 border border-white/10 overflow-hidden shadow-inner">
-          {/* List Header */}
-          <div className="shrink-0 flex items-center justify-between pb-2 border-b border-white/5 text-[11px]">
-            <div className="flex items-center gap-1.5 text-slate-300 font-medium">
-              <span className="text-cyan-400 font-semibold">{t.activeChecklist}</span>
-              <span className="px-1.5 py-0.2 rounded-full bg-cyan-500/15 text-cyan-400 font-mono text-[10px]">
-                {checklist.length}
-              </span>
-            </div>
-            {checklist.length > 0 && (
-              <button
-                onClick={onClearAll}
-                className="text-slate-400 hover:text-rose-400 flex items-center gap-1 text-[10px] transition"
-              >
-                <Trash2 className="w-3 h-3" />
-                <span>{t.clearAll}</span>
-              </button>
-            )}
-          </div>
+        {/* 3. Search List Section */}
+        <section className="flex-1 min-h-0 flex flex-col">
+          <h2 className="shrink-0 text-sm font-bold mb-2.5 text-[#0f172a] dark:text-white">
+            {uiLang === 'ku' ? 'لیستی گەڕان' : 'Search list'}
+          </h2>
 
-          {/* List Items */}
-          <div className="flex-1 min-h-0 overflow-y-auto pt-2 space-y-1.5 pr-1">
+          <div className="flex-1 min-h-0 overflow-y-auto space-y-3 pr-0.5">
             {checklist.length > 0 ? (
-              checklist.map((item, idx) => (
-                <div
-                  key={item.id}
-                  className="flex items-center justify-between gap-2 px-2.5 py-1.5 rounded-xl bg-slate-900/60 border border-white/5 hover:border-cyan-500/30 text-xs transition animate-fade-in"
-                >
-                  <div className="flex items-center gap-2 min-w-0">
-                    <span className="w-4 h-4 rounded-md bg-slate-800 text-slate-400 font-mono text-[10px] flex items-center justify-center shrink-0">
-                      {idx + 1}
-                    </span>
-                    <span className="font-semibold text-slate-200 truncate">
-                      {item.text}
-                    </span>
-                  </div>
-                  <button
-                    onClick={() => onRemoveItem(item.id)}
-                    className="p-1 rounded-md text-slate-500 hover:text-rose-400 hover:bg-rose-500/10 transition"
-                    aria-label="Remove"
+              checklist.map((item, idx) => {
+                const isDone = Boolean(item.isCompleted);
+                return (
+                  <div
+                    key={item.id}
+                    className="w-full h-13 px-4 bg-white dark:bg-[#0f0f0f] border border-[#cbd5e1] dark:border-white/70 rounded-none flex items-center justify-between gap-3 transition-colors"
                   >
-                    <X className="w-3.5 h-3.5" />
-                  </button>
-                </div>
-              ))
+                    <button
+                      type="button"
+                      onClick={() => onToggleItemCompleted(item.id)}
+                      className="flex-1 min-w-0 text-left flex items-center gap-1.5 py-2 text-sm font-bold text-[#0f172a] dark:text-white tabular-nums truncate"
+                      dir="ltr"
+                    >
+                      <span>{idx + 1}.</span>
+                      <span className="truncate">{item.text}</span>
+                    </button>
+
+                    {isDone ? (
+                      <button
+                        type="button"
+                        onClick={() => onToggleItemCompleted(item.id)}
+                        aria-label="Completed item"
+                        title="Tap to mark active again"
+                        className="min-w-[40px] min-h-[40px] -mr-2 flex items-center justify-center text-[#22c55e] hover:opacity-80 active:scale-90 transition"
+                      >
+                        <Check className="w-6 h-6 stroke-[2.75]" />
+                      </button>
+                    ) : (
+                      <button
+                        type="button"
+                        onClick={() => onRemoveItem(item.id)}
+                        aria-label="Remove item"
+                        title="Remove item"
+                        className="min-w-[40px] min-h-[40px] -mr-2 flex items-center justify-center text-[#dc2626] hover:opacity-80 active:scale-90 transition"
+                      >
+                        <X className="w-6 h-6 stroke-[2.75]" />
+                      </button>
+                    )}
+                  </div>
+                );
+              })
             ) : (
-              <div className="h-full flex flex-col items-center justify-center text-center p-4 text-slate-500 space-y-1">
-                <Sparkles className="w-5 h-5 text-slate-600 mb-1" />
-                <p className="text-xs font-medium text-slate-400">
-                  {t.emptyQueueWarning}
-                </p>
-                <p className="text-[10px] text-slate-600">
-                  {t.bulkPasteHint}
-                </p>
+              <div className="w-full h-13 px-4 bg-white/50 dark:bg-[#0f0f0f]/50 border border-dashed border-[#cbd5e1] dark:border-white/30 flex items-center justify-center text-xs font-semibold text-[#94a3b8] dark:text-[#52525b]">
+                {uiLang === 'ku'
+                  ? 'هیچ دانەیەک زیاد نەکراوە — لە سەرەوە وشەیەک بنووسە'
+                  : 'No items in search list — type a target above'}
               </div>
             )}
           </div>
-        </div>
-      </main>
+        </section>
+      </div>
 
-      {/* 3. Bottom Area: Segmented OCR Speed Control + Primary Action Button */}
-      <footer className="shrink-0 space-y-2 pt-1 pb-safe">
-        <div className="grid grid-cols-2 p-0.5 rounded-xl ios-glass text-[11px] font-medium text-center">
+      {/* 4. Bottom Controls: Language Selector Box + Bottom Action Bar */}
+      <footer className="shrink-0 pt-4 space-y-6 pb-safe" dir="ltr">
+        {/* Rectangular Segmented Language Selector */}
+        <div className="w-full h-12 bg-white dark:bg-[#0a0a0a] border border-[#cbd5e1] dark:border-white/70 p-1 flex items-center">
           <button
-            onClick={() => setOcrLanguage('eng')}
-            className={`py-1.5 rounded-lg transition ${
-              ocrLanguage === 'eng'
-                ? 'bg-slate-800 text-cyan-300 font-bold shadow-sm'
-                : 'text-slate-400 hover:text-slate-200'
-            }`}
-          >
-            English Fast (3x)
-          </button>
-          <button
+            type="button"
             onClick={() => setOcrLanguage('eng+ara')}
-            className={`py-1.5 rounded-lg transition ${
+            className={`flex-1 h-full flex items-center justify-center text-xs sm:text-sm font-bold transition ${
               ocrLanguage === 'eng+ara'
-                ? 'bg-slate-800 text-cyan-300 font-bold shadow-sm'
-                : 'text-slate-400 hover:text-slate-200'
+                ? 'bg-slate-200 dark:bg-[#1a1a1a] text-[#0f172a] dark:text-white rounded-[2px]'
+                : 'text-slate-600 dark:text-white hover:opacity-80'
             }`}
           >
             English + کوردی
           </button>
-        </div>
 
-        <button
-          onClick={onStartScanning}
-          disabled={checklist.length === 0}
-          className="w-full py-3.5 px-4 rounded-xl bg-gradient-to-r from-cyan-500 via-teal-400 to-emerald-400 disabled:opacity-35 disabled:pointer-events-none text-slate-950 font-extrabold text-sm sm:text-base shadow-lg shadow-cyan-500/20 active:scale-[0.98] transition-all flex items-center justify-center gap-2"
-        >
-          <Camera className="w-5 h-5 stroke-[2.3]" />
-          <span>
-            {t.startScanning}
-            {checklist.length > 0 ? ` (${checklist.length})` : ''}
-          </span>
-        </button>
-      </footer>
+          {/* Center Vertical Divider */}
+          <div className="w-[1px] h-5 bg-[#cbd5e1] dark:bg-white/70 shrink-0 mx-1" />
 
-      {/* iOS Safari PWA Install Modal */}
-      {showIOSModal && (
-        <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center p-3 bg-black/80 backdrop-blur-md animate-fade-in">
-          <div
-            className="w-full max-w-sm rounded-2xl bg-slate-900 border border-white/10 p-5 shadow-2xl text-white space-y-4"
-            dir={isRtl ? 'rtl' : 'ltr'}
+          <button
+            type="button"
+            onClick={() => setOcrLanguage('eng')}
+            className={`flex-1 h-full flex items-center justify-center text-xs sm:text-sm font-bold transition ${
+              ocrLanguage === 'eng'
+                ? 'bg-slate-200 dark:bg-[#1a1a1a] text-[#0f172a] dark:text-white rounded-[2px]'
+                : 'text-slate-600 dark:text-white hover:opacity-80'
+            }`}
           >
-            <div className="flex items-center justify-between border-b border-white/10 pb-2.5">
-              <h3 className="text-sm font-bold text-white">{t.iosInstallTitle}</h3>
-              <button
-                onClick={() => setShowIOSModal(false)}
-                className="p-1 rounded-full text-slate-400 hover:text-white"
-              >
-                <X className="w-4 h-4" />
-              </button>
-            </div>
-
-            <div className="space-y-3 text-xs text-slate-300">
-              <div className="flex items-start gap-2.5 p-2.5 rounded-xl bg-slate-800/60 border border-white/5">
-                <span className="w-5 h-5 rounded-md bg-blue-500/20 text-blue-400 flex items-center justify-center shrink-0 font-bold text-[10px]">
-                  1
-                </span>
-                <div className="flex items-center gap-1.5">
-                  <span>{t.iosStep1}</span>
-                  <Share2 className="w-3.5 h-3.5 text-blue-400 shrink-0 inline" />
-                </div>
-              </div>
-
-              <div className="flex items-start gap-2.5 p-2.5 rounded-xl bg-slate-800/60 border border-white/5">
-                <span className="w-5 h-5 rounded-md bg-emerald-500/20 text-emerald-400 flex items-center justify-center shrink-0 font-bold text-[10px]">
-                  2
-                </span>
-                <div className="flex items-center gap-1.5">
-                  <span>{t.iosStep2}</span>
-                  <PlusSquare className="w-3.5 h-3.5 text-emerald-400 shrink-0 inline" />
-                </div>
-              </div>
-            </div>
-
-            <button
-              onClick={() => setShowIOSModal(false)}
-              className="w-full py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-white font-medium text-xs transition"
-            >
-              {t.close}
-            </button>
-          </div>
+            English (Faster)
+          </button>
         </div>
-      )}
+
+        {/* Bottom Row: Moon/Sun Icon (Left) | Green Search Squircle (Center) | Globe Icon (Right) */}
+        <div className="flex items-center justify-between px-1">
+          {/* Theme Toggle (Moon / Sun) */}
+          <button
+            type="button"
+            onClick={onToggleTheme}
+            aria-label="Toggle Dark/Light Mode"
+            className="min-w-[44px] min-h-[44px] flex items-center justify-center text-[#0f172a] dark:text-white hover:opacity-75 active:scale-90 transition"
+          >
+            {theme === 'dark' ? (
+              <Moon className="w-7 h-7 fill-current stroke-[1.5] -rotate-12" />
+            ) : (
+              <Sun className="w-7 h-7 stroke-[2.2]" />
+            )}
+          </button>
+
+          {/* Primary Green Squircle Search Button */}
+          <button
+            type="button"
+            onClick={onStartScanning}
+            disabled={checklist.length === 0}
+            aria-label="Start Camera Search"
+            className="w-[88px] h-[76px] rounded-[26px] bg-[#248a3d] hover:bg-[#2aa147] disabled:opacity-35 disabled:pointer-events-none active:scale-95 transition-all flex items-center justify-center shadow-lg"
+          >
+            <Search className="w-10 h-10 text-white stroke-[3.5]" />
+          </button>
+
+          {/* UI Language Toggle (Globe) */}
+          <button
+            type="button"
+            onClick={handleCycleUiLanguage}
+            aria-label="Switch Interface Language"
+            className="min-w-[44px] min-h-[44px] flex items-center justify-center text-[#0f172a] dark:text-white hover:opacity-75 active:scale-90 transition relative"
+          >
+            <Globe className="w-7 h-7 stroke-[1.8]" />
+          </button>
+        </div>
+      </footer>
     </div>
   );
 };

@@ -1,14 +1,31 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { createWorker, Worker, PSM } from 'tesseract.js';
 import { OcrLanguage, MatchMode, MatchedWord, ScanResult, ChecklistItem, DetectedMatchGroup } from '../types';
-import { checkMatch, cleanAlphanumeric, normalizeText } from '../utils/textMatcher';
+import { normalizeText } from '../utils/textMatcher';
 import { triggerHaptic, playMatchChime } from '../utils/audioAlert';
 
-interface RawOCRWord {
+interface RawWordItem {
   text: string;
   confidence: number;
   bbox: { x0: number; y0: number; x1: number; y1: number };
-  lineIndex: number;
+}
+
+interface RawLineItem {
+  text: string;
+  confidence: number;
+  bbox: { x0: number; y0: number; x1: number; y1: number };
+  words: RawWordItem[];
+}
+
+/**
+ * Foolproof cleaner for English, Kurdish, and Arabic text/numbers
+ */
+function clean(str: string): string {
+  if (!str) return '';
+  return normalizeText(str)
+    .toLowerCase()
+    .trim()
+    .replace(/[^\w\u0600-\u06FF]/g, '');
 }
 
 export function useOCRScanner(selectedLang: OcrLanguage) {
@@ -22,15 +39,13 @@ export function useOCRScanner(selectedLang: OcrLanguage) {
   const [error, setError] = useState<string | null>(null);
 
   const workerRef = useRef<Worker | null>(null);
-  const offscreenCanvasRef = useRef<HTMLCanvasElement | null>(null);
-  const activeLangRef = useRef<OcrLanguage>(selectedLang);
-  const isBusyRef = useRef(false);
+  const ocrCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const isScanningRef = useRef(false);
   const previousMatchedItemIdsRef = useRef<Set<string>>(new Set());
 
-  // Initialize or reinitialize Tesseract v5 worker with PSM 11 (Sparse text for fine/faint text)
+  // Initialize persistent Tesseract v5 worker once per selected language
   useEffect(() => {
     let isCancelled = false;
-    activeLangRef.current = selectedLang;
 
     async function setupWorker() {
       setIsInitializing(true);
@@ -60,7 +75,7 @@ export function useOCRScanner(selectedLang: OcrLanguage) {
               } else if (m.status.includes('loading') || m.status.includes('traineddata')) {
                 const p = Math.round((m.progress || 0) * 40) + 50;
                 setInitProgress(Math.min(95, p));
-                setInitStatusText(`Downloading ${selectedLang} (${Math.round((m.progress || 0) * 100)}%)...`);
+                setInitStatusText(`Loading ${selectedLang} (${Math.round((m.progress || 0) * 100)}%)...`);
               }
             }
           },
@@ -71,17 +86,16 @@ export function useOCRScanner(selectedLang: OcrLanguage) {
           return;
         }
 
-        // PSM 11 = Sparse text: finds small, faint, and isolated words accurately across the frame
+        // PSM 6 = Assume a single uniform block of text (most reliable mode for screens, papers, and labels)
         await worker.setParameters({
-          tessedit_pageseg_mode: PSM.SPARSE_TEXT,
-          preserve_interword_spaces: '1',
+          tessedit_pageseg_mode: PSM.SINGLE_BLOCK,
         });
 
         workerRef.current = worker;
         setIsInitializing(false);
         setWorkerStatus('ready');
         setInitProgress(100);
-        setInitStatusText('Ready');
+        setInitStatusText('Ready / Scanning...');
         setError(null);
       } catch (err) {
         if (!isCancelled) {
@@ -106,50 +120,16 @@ export function useOCRScanner(selectedLang: OcrLanguage) {
     };
   }, [selectedLang]);
 
-  /**
-   * If an OCR word token contains extra prefix/suffix characters around the target word
-   * (e.g. "item:Recording" or "123-Recording" when searching "Recording"),
-   * slice the bounding box horizontally to wrap ONLY the matched target characters.
-   */
-  const tightenWordBbox = (
-    bbox: { x0: number; y0: number; x1: number; y1: number },
-    detectedText: string,
-    targetText: string
-  ) => {
-    const normDetected = normalizeText(cleanAlphanumeric(detectedText));
-    const normTarget = normalizeText(cleanAlphanumeric(targetText));
-
-    if (
-      normDetected.length > normTarget.length + 1 &&
-      normTarget.length >= 2 &&
-      normDetected.includes(normTarget)
-    ) {
-      const idx = normDetected.indexOf(normTarget);
-      if (idx >= 0) {
-        const totalWidth = bbox.x1 - bbox.x0;
-        const startRatio = idx / normDetected.length;
-        const endRatio = (idx + normTarget.length) / normDetected.length;
-        return {
-          x0: bbox.x0 + totalWidth * startRatio,
-          y0: bbox.y0,
-          x1: bbox.x0 + totalWidth * endRatio,
-          y1: bbox.y1,
-        };
-      }
-    }
-    return bbox;
-  };
-
-  // Main scan function: High-clarity 1280px pipeline for faint & fine text + strict word-level bbox extraction
+  // Clean, fast scan function: 1024px raw drawImage (ZERO ctx.filter / SVG filters)
   const scanSource = useCallback(
     async (
       source: HTMLVideoElement | HTMLCanvasElement | HTMLImageElement,
       targetItems: ChecklistItem[],
-      mode: MatchMode,
+      _mode: MatchMode,
       enableHaptics = true,
       enableSound = true
     ): Promise<ScanResult | null> => {
-      if (!workerRef.current || isBusyRef.current || isInitializing || targetItems.length === 0) {
+      if (!workerRef.current || isScanningRef.current || isInitializing || targetItems.length === 0) {
         return null;
       }
 
@@ -159,124 +139,131 @@ export function useOCRScanner(selectedLang: OcrLanguage) {
         }
       }
 
-      isBusyRef.current = true;
+      isScanningRef.current = true;
       setIsProcessing(true);
       const startTime = performance.now();
 
       try {
-        let srcW = 0;
-        let srcH = 0;
+        let videoW = 0;
+        let videoH = 0;
         if (source instanceof HTMLVideoElement) {
-          srcW = source.videoWidth;
-          srcH = source.videoHeight;
+          videoW = source.videoWidth;
+          videoH = source.videoHeight;
         } else if (source instanceof HTMLCanvasElement) {
-          srcW = source.width;
-          srcH = source.height;
+          videoW = source.width;
+          videoH = source.height;
         } else if (source instanceof HTMLImageElement) {
-          srcW = source.naturalWidth || source.width;
-          srcH = source.naturalHeight || source.height;
+          videoW = source.naturalWidth || source.width;
+          videoH = source.naturalHeight || source.height;
         }
 
-        if (srcW === 0 || srcH === 0) {
-          isBusyRef.current = false;
-          setIsProcessing(false);
+        if (videoW === 0 || videoH === 0) {
           return null;
         }
 
-        // Preserve full 1280px detail (and upscale low-res frames to 1280px) so small/fine text is crisp
-        const targetW = srcW < 1280 ? 1280 : Math.min(1440, srcW);
-        const scaleX = targetW / srcW;
-        const targetH = Math.round(srcH * scaleX);
-        const scaleY = targetH / srcH;
+        // Offscreen canvas width fixed at 1024px (proportional height)
+        const ocrW = 1024;
+        const ocrH = Math.max(1, Math.round((videoH / videoW) * ocrW));
 
-        if (!offscreenCanvasRef.current) {
-          offscreenCanvasRef.current = document.createElement('canvas');
+        if (!ocrCanvasRef.current) {
+          ocrCanvasRef.current = document.createElement('canvas');
         }
-        const canvas = offscreenCanvasRef.current;
-        if (canvas.width !== targetW || canvas.height !== targetH) {
-          canvas.width = targetW;
-          canvas.height = targetH;
+        const ocrCanvas = ocrCanvasRef.current;
+        if (ocrCanvas.width !== ocrW || ocrCanvas.height !== ocrH) {
+          ocrCanvas.width = ocrW;
+          ocrCanvas.height = ocrH;
         }
 
-        const ctx = canvas.getContext('2d');
-        if (!ctx) {
-          isBusyRef.current = false;
-          setIsProcessing(false);
+        const ocrCtx = ocrCanvas.getContext('2d');
+        if (!ocrCtx) {
           return null;
         }
 
-        // High-quality bicubic-like smoothing + GPU contrast/brightness boost for faint & fine text
-        ctx.imageSmoothingEnabled = true;
-        ctx.imageSmoothingQuality = 'high';
-        ctx.filter = 'grayscale(1) contrast(1.75) brightness(1.06)';
-        ctx.drawImage(source, 0, 0, targetW, targetH);
-        ctx.filter = 'none';
+        // Direct, raw drawImage — NO ctx.filter or SVG filters (100% iOS Safari compatible)
+        ocrCtx.drawImage(source, 0, 0, ocrW, ocrH);
 
-        const ret = await workerRef.current.recognize(canvas);
-        const rawFullText = (ret.data.text || '').trim();
+        const ret = await workerRef.current.recognize(ocrCanvas);
+        const data = ret.data;
+        const rawFullText = (data.text || '').trim();
 
-        // Update raw text preview
-        const sanitizedPreview = rawFullText.replace(/\s+/g, ' ').slice(0, 50);
+        // Update top debug bar with raw detected text preview
+        const sanitizedPreview = rawFullText.replace(/\s+/g, ' ').slice(0, 60);
         setRawTextPreview(sanitizedPreview);
 
-        // Extract STRICTLY word-level tokens (NEVER whole line.bbox!)
-        const rawWords: RawOCRWord[] = [];
-        let lineCounter = 0;
+        // Collect all words and lines from Tesseract output
+        const wordsList: RawWordItem[] = [];
+        const linesList: RawLineItem[] = [];
 
-        if (ret.data.lines && ret.data.lines.length > 0) {
-          for (const line of ret.data.lines) {
-            lineCounter++;
-            if (line.words && line.words.length > 0) {
-              for (const w of line.words) {
-                const txt = (w.text || '').trim();
-                if (txt.length > 0 && w.bbox) {
-                  rawWords.push({
-                    text: txt,
-                    confidence: Math.round(w.confidence || 0),
-                    bbox: w.bbox,
-                    lineIndex: lineCounter,
-                  });
-                }
-              }
+        const rawTopWords = (data as unknown as { words?: RawWordItem[] }).words;
+        if (rawTopWords && Array.isArray(rawTopWords) && rawTopWords.length > 0) {
+          for (const w of rawTopWords) {
+            if (w.text && w.text.trim() && w.bbox) {
+              wordsList.push({
+                text: w.text.trim(),
+                confidence: Math.round(w.confidence || 80),
+                bbox: w.bbox,
+              });
             }
           }
         }
 
-        // Fallback to top-level words or nested blocks->paragraphs->lines->words if lines array was empty
-        if (rawWords.length === 0) {
-          const topWords = (ret.data as unknown as { words?: Array<{ text: string; confidence: number; bbox: { x0: number; y0: number; x1: number; y1: number } }> }).words;
-          if (topWords && topWords.length > 0) {
-            for (const w of topWords) {
-              const txt = (w.text || '').trim();
-              if (txt.length > 0 && w.bbox) {
-                rawWords.push({
-                  text: txt,
-                  confidence: Math.round(w.confidence || 0),
-                  bbox: w.bbox,
-                  lineIndex: 0,
-                });
+        if (data.lines && Array.isArray(data.lines)) {
+          for (const line of data.lines) {
+            const lineWords: RawWordItem[] = [];
+            if (line.words && Array.isArray(line.words)) {
+              for (const w of line.words) {
+                if (w.text && w.text.trim() && w.bbox) {
+                  const item: RawWordItem = {
+                    text: w.text.trim(),
+                    confidence: Math.round(w.confidence || 80),
+                    bbox: w.bbox,
+                  };
+                  lineWords.push(item);
+                  if (wordsList.length === 0) {
+                    wordsList.push(item);
+                  }
+                }
               }
             }
-          } else if (ret.data.blocks) {
-            for (const block of ret.data.blocks) {
-              if (block.paragraphs) {
-                for (const p of block.paragraphs) {
-                  if (p.lines) {
-                    for (const l of p.lines) {
-                      lineCounter++;
-                      if (l.words) {
-                        for (const w of l.words) {
-                          const txt = (w.text || '').trim();
-                          if (txt.length > 0 && w.bbox) {
-                            rawWords.push({
-                              text: txt,
-                              confidence: Math.round(w.confidence || 0),
-                              bbox: w.bbox,
-                              lineIndex: lineCounter,
-                            });
-                          }
+            if (line.text && line.text.trim() && line.bbox) {
+              linesList.push({
+                text: line.text.trim(),
+                confidence: Math.round(line.confidence || 80),
+                bbox: line.bbox,
+                words: lineWords,
+              });
+            }
+          }
+        }
+
+        // Also check blocks -> paragraphs -> lines if both wordsList and linesList were empty
+        if (wordsList.length === 0 && linesList.length === 0 && data.blocks) {
+          for (const b of data.blocks) {
+            if (b.paragraphs) {
+              for (const p of b.paragraphs) {
+                if (p.lines) {
+                  for (const l of p.lines) {
+                    const lineWords: RawWordItem[] = [];
+                    if (l.words) {
+                      for (const w of l.words) {
+                        if (w.text && w.text.trim() && w.bbox) {
+                          const item: RawWordItem = {
+                            text: w.text.trim(),
+                            confidence: Math.round(w.confidence || 80),
+                            bbox: w.bbox,
+                          };
+                          lineWords.push(item);
+                          wordsList.push(item);
                         }
                       }
+                    }
+                    if (l.text && l.text.trim() && l.bbox) {
+                      linesList.push({
+                        text: l.text.trim(),
+                        confidence: Math.round(l.confidence || 80),
+                        bbox: l.bbox,
+                        words: lineWords,
+                      });
                     }
                   }
                 }
@@ -285,139 +272,101 @@ export function useOCRScanner(selectedLang: OcrLanguage) {
           }
         }
 
-        // Exact inverse scale back to native video source coordinates (srcW x srcH)
-        const invScaleX = 1 / scaleX;
-        const invScaleY = 1 / scaleY;
-
-        const allWords: MatchedWord[] = [];
         const matchedWords: MatchedWord[] = [];
         const itemToMatchesMap = new Map<string, MatchedWord[]>();
 
-        // 1. Evaluate every individual word token first
-        const matchedWordIndicesByTarget = new Map<string, Set<number>>();
+        // Loop through user's active checklist items
+        for (const targetItem of targetItems) {
+          const cleanTarget = clean(targetItem.text);
+          if (!cleanTarget) continue;
 
-        for (let i = 0; i < rawWords.length; i++) {
-          const w = rawWords[i];
-          let bestItem: ChecklistItem | null = null;
-          let highestScore = 0;
+          let matchedInWords = false;
 
-          for (const item of targetItems) {
-            // Only single-word match here if target doesn't require multiple words, or if single word contains it
-            const { isMatch, score } = checkMatch(w.text, item.text, mode);
-            if (isMatch && score > highestScore) {
-              highestScore = score;
-              bestItem = item;
+          // 1. Check every word in data.words first
+          for (let i = 0; i < wordsList.length; i++) {
+            const w = wordsList[i];
+            const cleanWord = clean(w.text);
+            if (!cleanWord) continue;
+
+            const isDirectMatch = cleanWord.includes(cleanTarget);
+            const isReverseMatch =
+              cleanWord.length >= 3 &&
+              cleanTarget.length >= 3 &&
+              cleanTarget.includes(cleanWord);
+
+            if (isDirectMatch || isReverseMatch) {
+              matchedInWords = true;
+              const matchObj: MatchedWord = {
+                id: `w-${targetItem.id}-${i}-${Date.now()}`,
+                text: w.text,
+                normalizedText: cleanWord,
+                confidence: w.confidence,
+                bbox: w.bbox,
+                isMatch: true,
+                score: isDirectMatch ? 1.0 : 0.9,
+                matchedItemId: targetItem.id,
+                matchedItemText: targetItem.text,
+              };
+
+              matchedWords.push(matchObj);
+              if (!itemToMatchesMap.has(targetItem.id)) {
+                itemToMatchesMap.set(targetItem.id, []);
+              }
+              itemToMatchesMap.get(targetItem.id)!.push(matchObj);
             }
           }
 
-          const tightCanvasBbox = bestItem
-            ? tightenWordBbox(w.bbox, w.text, bestItem.text)
-            : w.bbox;
+          // 2. Fallback: check data.lines if not matched by individual word (e.g. multi-word target)
+          if (!matchedInWords) {
+            for (let lIdx = 0; lIdx < linesList.length; lIdx++) {
+              const line = linesList[lIdx];
+              const cleanLine = clean(line.text);
+              if (!cleanLine || !cleanLine.includes(cleanTarget)) continue;
 
-          const nativeBbox = {
-            x0: tightCanvasBbox.x0 * invScaleX,
-            y0: tightCanvasBbox.y0 * invScaleY,
-            x1: tightCanvasBbox.x1 * invScaleX,
-            y1: tightCanvasBbox.y1 * invScaleY,
-          };
+              // Find the subset of words inside this line that belong to the target phrase
+              const targetParts = targetItem.text
+                .trim()
+                .split(/\s+/)
+                .map((p) => clean(p))
+                .filter(Boolean);
 
-          const isMatch = Boolean(bestItem);
-          const wordItem: MatchedWord = {
-            id: `word-${i}-${Date.now()}`,
-            text: w.text,
-            normalizedText: w.text,
-            confidence: w.confidence,
-            bbox: nativeBbox,
-            isMatch,
-            score: highestScore,
-            matchedItemId: bestItem?.id,
-            matchedItemText: bestItem?.text,
-          };
+              const matchingLineWords = line.words.filter((lw) => {
+                const cw = clean(lw.text);
+                return (
+                  cw.length > 0 &&
+                  (cleanTarget.includes(cw) ||
+                    cw.includes(cleanTarget) ||
+                    targetParts.some((tp) => cw.includes(tp) || tp.includes(cw)))
+                );
+              });
 
-          allWords.push(wordItem);
+              const bboxToUse =
+                matchingLineWords.length > 0
+                  ? {
+                      x0: Math.min(...matchingLineWords.map((lw) => lw.bbox.x0)),
+                      y0: Math.min(...matchingLineWords.map((lw) => lw.bbox.y0)),
+                      x1: Math.max(...matchingLineWords.map((lw) => lw.bbox.x1)),
+                      y1: Math.max(...matchingLineWords.map((lw) => lw.bbox.y1)),
+                    }
+                  : line.bbox;
 
-          if (isMatch && bestItem) {
-            matchedWords.push(wordItem);
-            if (!itemToMatchesMap.has(bestItem.id)) {
-              itemToMatchesMap.set(bestItem.id, []);
-            }
-            itemToMatchesMap.get(bestItem.id)!.push(wordItem);
+              const matchObj: MatchedWord = {
+                id: `l-${targetItem.id}-${lIdx}-${Date.now()}`,
+                text: line.text,
+                normalizedText: cleanLine,
+                confidence: line.confidence,
+                bbox: bboxToUse,
+                isMatch: true,
+                score: 0.95,
+                matchedItemId: targetItem.id,
+                matchedItemText: targetItem.text,
+              };
 
-            if (!matchedWordIndicesByTarget.has(bestItem.id)) {
-              matchedWordIndicesByTarget.set(bestItem.id, new Set());
-            }
-            matchedWordIndicesByTarget.get(bestItem.id)!.add(i);
-          }
-        }
-
-        // 2. Multi-word phrase support: check consecutive word slices (2 to 4 words on the same line)
-        // Computes tight union bbox of ONLY the consecutive matched words, never the whole line!
-        for (const item of targetItems) {
-          const targetWordsCount = item.text.trim().split(/\s+/).length;
-          // Also check 2-word slice in case OCR split a single target word into two adjacent tokens
-          const maxWindow = Math.min(4, Math.max(2, targetWordsCount + 1));
-
-          for (let i = 0; i < rawWords.length; i++) {
-            const alreadyMatchedIndices = matchedWordIndicesByTarget.get(item.id);
-            if (alreadyMatchedIndices && alreadyMatchedIndices.has(i)) continue;
-
-            for (let winLen = 2; winLen <= maxWindow && i + winLen <= rawWords.length; winLen++) {
-              const slice = rawWords.slice(i, i + winLen);
-              // Must be on the same line
-              if (slice.some((sw) => sw.lineIndex !== slice[0].lineIndex)) break;
-              // Skip if any word in slice already matched this item individually
-              if (alreadyMatchedIndices && slice.some((_, idx) => alreadyMatchedIndices.has(i + idx))) {
-                continue;
+              matchedWords.push(matchObj);
+              if (!itemToMatchesMap.has(targetItem.id)) {
+                itemToMatchesMap.set(targetItem.id, []);
               }
-
-              const joinedText = slice.map((s) => s.text).join(' ');
-              const { isMatch, score } = checkMatch(joinedText, item.text, mode);
-
-              // Ensure the match actually spans the slice (neither the first nor last word alone is the full match)
-              if (isMatch) {
-                const firstAlone = checkMatch(slice[0].text, item.text, mode).isMatch;
-                const lastAlone = checkMatch(slice[slice.length - 1].text, item.text, mode).isMatch;
-                if (!firstAlone && !lastAlone) {
-                  const unionX0 = Math.min(...slice.map((s) => s.bbox.x0)) * invScaleX;
-                  const unionY0 = Math.min(...slice.map((s) => s.bbox.y0)) * invScaleY;
-                  const unionX1 = Math.max(...slice.map((s) => s.bbox.x1)) * invScaleX;
-                  const unionY1 = Math.max(...slice.map((s) => s.bbox.y1)) * invScaleY;
-                  const avgConf = Math.round(
-                    slice.reduce((acc, s) => acc + s.confidence, 0) / slice.length
-                  );
-
-                  const phraseMatch: MatchedWord = {
-                    id: `phrase-${i}-${winLen}-${Date.now()}`,
-                    text: joinedText,
-                    normalizedText: joinedText,
-                    confidence: avgConf,
-                    bbox: {
-                      x0: unionX0,
-                      y0: unionY0,
-                      x1: unionX1,
-                      y1: unionY1,
-                    },
-                    isMatch: true,
-                    score,
-                    matchedItemId: item.id,
-                    matchedItemText: item.text,
-                  };
-
-                  matchedWords.push(phraseMatch);
-                  if (!itemToMatchesMap.has(item.id)) {
-                    itemToMatchesMap.set(item.id, []);
-                  }
-                  itemToMatchesMap.get(item.id)!.push(phraseMatch);
-
-                  if (!matchedWordIndicesByTarget.has(item.id)) {
-                    matchedWordIndicesByTarget.set(item.id, new Set());
-                  }
-                  for (let k = 0; k < winLen; k++) {
-                    matchedWordIndicesByTarget.get(item.id)!.add(i + k);
-                  }
-                  break;
-                }
-              }
+              itemToMatchesMap.get(targetItem.id)!.push(matchObj);
             }
           }
         }
@@ -439,14 +388,15 @@ export function useOCRScanner(selectedLang: OcrLanguage) {
         }
 
         const endTime = performance.now();
+        // Store ocrW & ocrH as frameWidth & frameHeight so bbox coordinates map directly from ocrCanvas space
         const result: ScanResult = {
-          allWords,
+          allWords: matchedWords,
           matchedWords,
           detectedGroups,
           fullText: rawFullText,
           processingTimeMs: Math.round(endTime - startTime),
-          frameWidth: srcW,
-          frameHeight: srcH,
+          frameWidth: ocrW,
+          frameHeight: ocrH,
         };
 
         setLastScanResult(result);
@@ -471,7 +421,7 @@ export function useOCRScanner(selectedLang: OcrLanguage) {
         console.warn('OCR scan error:', err);
         return null;
       } finally {
-        isBusyRef.current = false;
+        isScanningRef.current = false;
         setIsProcessing(false);
       }
     },
