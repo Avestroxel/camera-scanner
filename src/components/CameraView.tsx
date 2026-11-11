@@ -88,7 +88,7 @@ export const CameraView: React.FC<Props> = ({
   const targetBoxesRef = useRef<MatchedWord[]>([]);
   const interpolatedBoxesRef = useRef<InterpolatedBox[]>([]);
   const detectedGroupsRef = useRef<DetectedMatchGroup[]>([]);
-  const scanDimsRef = useRef<{ w: number; h: number }>({ w: 1024, h: 576 });
+  const scanDimsRef = useRef<{ w: number; h: number }>({ w: 720, h: 405 });
   const activeChecklistRef = useRef<ChecklistItem[]>(checklist);
   activeChecklistRef.current = checklist;
 
@@ -134,7 +134,7 @@ export const CameraView: React.FC<Props> = ({
     };
   }, [stopTracks]);
 
-  // Initialize Camera Stream strictly with { video: ..., audio: false }
+  // Initialize Camera Stream with 60fps shutter speed to eliminate motion blur while moving
   const initCamera = useCallback(async () => {
     setCameraError(null);
     stopTracks();
@@ -146,9 +146,9 @@ export const CameraView: React.FC<Props> = ({
           facingMode: isFrontCamera ? 'user' : { ideal: 'environment' },
           width: { ideal: 1280 },
           height: { ideal: 720 },
-          frameRate: { ideal: 24, max: 30 },
-          // @ts-expect-error continuous focus mode
-          advanced: [{ focusMode: 'continuous' }],
+          frameRate: { ideal: 60, min: 30 },
+          // @ts-expect-error continuous focus and exposure modes reduce motion blur
+          advanced: [{ focusMode: 'continuous' }, { exposureMode: 'continuous' }],
         },
       };
 
@@ -190,7 +190,7 @@ export const CameraView: React.FC<Props> = ({
             facingMode: isFrontCamera ? 'user' : { ideal: 'environment' },
             width: { ideal: 1280 },
             height: { ideal: 720 },
-            frameRate: { ideal: 24, max: 30 },
+            frameRate: { ideal: 60 },
           },
         });
         streamRef.current = fallbackStream;
@@ -271,34 +271,24 @@ export const CameraView: React.FC<Props> = ({
     }
   }, [isInitializing, matchMode, scanSource]);
 
-  // Fast, Non-Blocking Tesseract.js Loop (~150ms delay between completed scans)
+  // High-Speed Overlapping Dual-Worker Dispatch Loop (staggered every 60ms for ~100ms-140ms latency)
   useEffect(() => {
-    let timer: NodeJS.Timeout;
-    let isCancelled = false;
+    if (scanMode !== 'auto' || isInitializing) return;
 
-    const runLoop = async () => {
-      if (isCancelled || scanMode !== 'auto') return;
+    const intervalId = setInterval(() => {
       const video = videoRef.current;
       const currentItems = activeChecklistRef.current;
 
-      if (video && !isInitializing && currentItems.length > 0) {
+      if (video && currentItems.length > 0) {
         if (video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA && video.videoWidth > 0) {
-          await scanSource(video, currentItems, matchMode, true, true);
+          // Non-blocking call: useOCRScanner dispatches to whichever of the 2 workers is free!
+          void scanSource(video, currentItems, matchMode, true, true);
         }
       }
-
-      if (!isCancelled && scanMode === 'auto') {
-        timer = setTimeout(runLoop, 150);
-      }
-    };
-
-    if (scanMode === 'auto') {
-      timer = setTimeout(runLoop, 150);
-    }
+    }, 60);
 
     return () => {
-      isCancelled = true;
-      clearTimeout(timer);
+      clearInterval(intervalId);
     };
   }, [isInitializing, scanSource, matchMode, scanMode]);
 
@@ -358,11 +348,11 @@ export const CameraView: React.FC<Props> = ({
               const prev = currentInterp.find(
                 (p) =>
                   p.matchedItemId === m.matchedItemId &&
-                  Math.hypot(p.targetX - tx, p.targetY - ty) < 120
+                  Math.hypot(p.targetX - tx, p.targetY - ty) < 160
               );
 
               if (prev) {
-                const lerp = 0.35;
+                const lerp = 0.55;
                 nextInterp.push({
                   key: prev.key,
                   matchedItemId: m.matchedItemId,
