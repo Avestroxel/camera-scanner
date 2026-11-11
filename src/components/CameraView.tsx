@@ -8,8 +8,16 @@ import {
   CheckCheck,
   ChevronDown,
   RefreshCw,
+  Play,
+  ScanLine,
 } from 'lucide-react';
-import { OcrLanguage, MatchMode, ChecklistItem, DetectedMatchGroup } from '../types';
+import {
+  OcrLanguage,
+  MatchMode,
+  MatchedWord,
+  ChecklistItem,
+  DetectedMatchGroup,
+} from '../types';
 import { Translation } from '../translations';
 import { useOCRScanner } from '../hooks/useOCRScanner';
 import { CelebrationOverlay } from './CelebrationOverlay';
@@ -29,21 +37,18 @@ interface Props {
   onRestartBatch: () => void;
 }
 
-interface TrackedSpatialBox {
-  key: string;
-  targetId: string;
-  // Intrinsic video coordinates (videoW x videoH)
+type ScannerViewState = 'LIVE_VIEWFINDER' | 'FROZEN_LOCK';
+
+interface CompletedFreezeBox {
+  id: string;
+  itemId: string;
+  text: string;
   bbox: { x0: number; y0: number; x1: number; y1: number };
-  // Rendered screen-space coordinates
-  renderX: number;
-  renderY: number;
-  renderW: number;
-  renderH: number;
-  lastSeenTimestamp: number;
-  initialized: boolean;
 }
 
-const HOLD_TTL_MS = 400;
+const THUMB_W = 64;
+const THUMB_H = 36;
+const STEADY_DIFF_THRESHOLD = 8.0;
 
 export const CameraView: React.FC<Props> = ({
   checklist,
@@ -59,9 +64,27 @@ export const CameraView: React.FC<Props> = ({
   onRestartBatch,
 }) => {
   const videoRef = useRef<HTMLVideoElement | null>(null);
-  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const frozenCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
+
+  // Offscreen clean bitmap of the frozen frame + 64x36 motion-stability thumbnail canvas
+  const frozenBitmapRef = useRef<HTMLCanvasElement | null>(null);
+  const motionThumbCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const prevThumbLumaRef = useRef<Uint8Array | null>(null);
+
+  const [viewState, setViewState] = useState<ScannerViewState>('LIVE_VIEWFINDER');
+  const viewStateRef = useRef<ScannerViewState>('LIVE_VIEWFINDER');
+  viewStateRef.current = viewState;
+
+  const [isSteady, setIsSteady] = useState<boolean>(false);
+  const [shutterFlash, setShutterFlash] = useState<boolean>(false);
+  const [frozenAnalyzing, setFrozenAnalyzing] = useState<boolean>(false);
+
+  // Active & completed boxes on the current frozen frame (in exact frozenBitmap pixel coordinates)
+  const [frozenMatchedWords, setFrozenMatchedWords] = useState<MatchedWord[]>([]);
+  const [frozenDetectedGroups, setFrozenDetectedGroups] = useState<DetectedMatchGroup[]>([]);
+  const [completedOnFreezeBoxes, setCompletedOnFreezeBoxes] = useState<CompletedFreezeBox[]>([]);
 
   const [cameraError, setCameraError] = useState<string | null>(null);
   const [torchAvailable, setTorchAvailable] = useState(false);
@@ -70,32 +93,48 @@ export const CameraView: React.FC<Props> = ({
   const [showQueueDropdown, setShowQueueDropdown] = useState(false);
   const [successToast, setSuccessToast] = useState<string | null>(null);
 
-  // Zoom control state (Hardware optical zoom or synchronized CSS digital zoom fallback)
+  // Live hardware/digital zoom (1x, 2x, 3x) + Frozen pinch-to-zoom & pan (1x..4x)
   const [zoomLevel, setZoomLevel] = useState<number>(1);
   const [hardwareZoomAvailable, setHardwareZoomAvailable] = useState(false);
   const [zoomMinMax, setZoomMinMax] = useState<{ min: number; max: number }>({ min: 1, max: 3 });
 
-  // Auto vs Manual (Tap to scan)
-  const [scanMode, setScanMode] = useState<'auto' | 'manual'>('auto');
-  const [manualScanPulse, setManualScanPulse] = useState(false);
+  const [frozenPan, setFrozenPan] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
+  const touchGestureRef = useRef<{
+    isDragging: boolean;
+    hasMoved: boolean;
+    startX: number;
+    startY: number;
+    startPanX: number;
+    startPanY: number;
+    initialPinchDist: number | null;
+    initialZoom: number;
+  }>({
+    isDragging: false,
+    hasMoved: false,
+    startX: 0,
+    startY: 0,
+    startPanX: 0,
+    startPanY: 0,
+    initialPinchDist: null,
+    initialZoom: 1,
+  });
 
-  // 1:1 Native Center-Strip OCR Hook
+  // Auto-Freeze vs Tap-to-Freeze mode
+  const [scanMode, setScanMode] = useState<'auto' | 'manual'>('auto');
+
   const {
     isInitializing,
-    lastScanResult,
-    scanSource,
+    isScanningSnapshot,
+    scanSnapshot,
     purgeItem,
     purgeMultipleItems,
   } = useOCRScanner(ocrLanguage, checklist);
 
-  const trackedBoxesRef = useRef<TrackedSpatialBox[]>([]);
-  const detectedGroupsRef = useRef<DetectedMatchGroup[]>([]);
-  const scanDimsRef = useRef<{ w: number; h: number }>({ w: 1920, h: 1080 });
   const activeChecklistRef = useRef<ChecklistItem[]>(checklist);
   activeChecklistRef.current = checklist;
   const completedIdsRef = useRef<Set<string>>(new Set());
 
-  // Keep completedIdsRef synced with active checklist
+  // Sync completedIdsRef if checklist resets
   useEffect(() => {
     const activeIds = new Set(checklist.map((i) => i.id));
     for (const id of Array.from(completedIdsRef.current)) {
@@ -103,90 +142,110 @@ export const CameraView: React.FC<Props> = ({
         completedIdsRef.current.delete(id);
       }
     }
-    trackedBoxesRef.current = trackedBoxesRef.current.filter(
-      (b) => activeIds.has(b.targetId) && !completedIdsRef.current.has(b.targetId)
-    );
   }, [checklist]);
 
-  // Sync latest OCR matched bounding boxes into trackedBoxesRef (1-to-1 replacement prevents x3 ghost splitting!)
-  useEffect(() => {
-    if (!lastScanResult) return;
-
-    const now = performance.now();
-    const activeIds = new Set(
-      activeChecklistRef.current
-        .filter((i) => !completedIdsRef.current.has(i.id))
-        .map((i) => i.id)
-    );
-
-    detectedGroupsRef.current = lastScanResult.detectedGroups.filter((g) =>
-      activeIds.has(g.item.id)
-    );
-
-    const videoW = lastScanResult.frameWidth || 1920;
-    const videoH = lastScanResult.frameHeight || 1080;
-    scanDimsRef.current = { w: videoW, h: videoH };
-
-    const currentTracks = trackedBoxesRef.current.filter(
-      (t) => activeIds.has(t.targetId) && !completedIdsRef.current.has(t.targetId)
-    );
-    const incomingWords = lastScanResult.matchedWords.filter(
-      (w) => w.matchedItemId && activeIds.has(w.matchedItemId) && !completedIdsRef.current.has(w.matchedItemId)
-    );
-
-    const updatedTracks: TrackedSpatialBox[] = [];
-    const matchedPrevIndices = new Set<number>();
-
-    for (let i = 0; i < incomingWords.length; i++) {
-      const m = incomingWords[i];
-      const targetId = m.matchedItemId!;
-
-      const mCx = (m.bbox.x0 + m.bbox.x1) * 0.5;
-      const mCy = (m.bbox.y0 + m.bbox.y1) * 0.5;
-
-      // Associate with nearest existing box of the same target item (< 80px in video coordinates)
-      let bestPrevIdx = -1;
-      let bestDist = 80;
-
-      for (let j = 0; j < currentTracks.length; j++) {
-        if (matchedPrevIndices.has(j)) continue;
-        const p = currentTracks[j];
-        if (p.targetId !== targetId) continue;
-
-        const pCx = (p.bbox.x0 + p.bbox.x1) * 0.5;
-        const pCy = (p.bbox.y0 + p.bbox.y1) * 0.5;
-        const dist = Math.hypot(mCx - pCx, mCy - pCy);
-        if (dist < bestDist) {
-          bestDist = dist;
-          bestPrevIdx = j;
-        }
-      }
-
-      if (bestPrevIdx >= 0) {
-        matchedPrevIndices.add(bestPrevIdx);
-        const prev = currentTracks[bestPrevIdx];
-        updatedTracks.push({
-          ...prev,
-          bbox: m.bbox,
-          lastSeenTimestamp: now,
-        });
-      } else {
-        updatedTracks.push({
-          key: `${targetId}_${i}_${now}`,
-          targetId,
-          bbox: m.bbox,
-          renderX: 0,
-          renderY: 0,
-          renderW: 0,
-          renderH: 0,
-          lastSeenTimestamp: now,
-          initialized: false,
-        });
-      }
+  // Redraw the FROZEN_LOCK canvas (clean frozen snapshot bitmap + 100% pixel-locked green boxes & ✓ badges)
+  const renderFrozenCanvas = useCallback(() => {
+    const canvas = frozenCanvasRef.current;
+    const sourceBitmap = frozenBitmapRef.current;
+    if (!canvas || !sourceBitmap || sourceBitmap.width === 0 || sourceBitmap.height === 0) {
+      return;
     }
 
-    trackedBoxesRef.current = updatedTracks;
-  }, [lastScanResult]);
+    const snapW = sourceBitmap.width;
+    const snapH = sourceBitmap.height;
+
+    if (canvas.width !== snapW || canvas.height !== snapH) {
+      canvas.width = snapW;
+      canvas.height = snapH;
+    }
+
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    // 1. Draw the exact high-resolution snapshot bitmap that Tesseract analyzed
+    ctx.clearRect(0, 0, snapW, snapH);
+    ctx.drawImage(sourceBitmap, 0, 0, snapW, snapH);
+
+    // Scale stroke and padding proportionally to the high-res snapshot dimensions
+    const scaleFactor = Math.max(1, snapW / 500);
+    const padX = Math.round(5 * scaleFactor);
+    const padY = Math.round(2.5 * scaleFactor);
+
+    // 2. Draw subtle completed checkmark badges for items checked off on this frozen screen
+    for (const doneBox of completedOnFreezeBoxes) {
+      const rx = doneBox.bbox.x0 - padX;
+      const ry = doneBox.bbox.y0 - padY;
+      const rw = doneBox.bbox.x1 - doneBox.bbox.x0 + padX * 2;
+      const rh = doneBox.bbox.y1 - doneBox.bbox.y0 + padY * 2;
+      const radius = Math.min(10 * scaleFactor, Math.max(4 * scaleFactor, rh * 0.3));
+
+      ctx.save();
+      ctx.fillStyle = 'rgba(34, 197, 94, 0.16)';
+      ctx.beginPath();
+      ctx.roundRect(rx, ry, rw, rh, radius);
+      ctx.fill();
+
+      ctx.strokeStyle = 'rgba(34, 197, 94, 0.65)';
+      ctx.lineWidth = 1.6 * scaleFactor;
+      ctx.setLineDash([4 * scaleFactor, 3 * scaleFactor]);
+      ctx.stroke();
+
+      // Small green ✓ circle badge on the right edge of the completed box
+      const badgeR = Math.max(8 * scaleFactor, Math.min(13 * scaleFactor, rh * 0.42));
+      const badgeCx = rx + rw;
+      const badgeCy = ry;
+
+      ctx.setLineDash([]);
+      ctx.fillStyle = '#22c55e';
+      ctx.beginPath();
+      ctx.arc(badgeCx, badgeCy, badgeR, 0, Math.PI * 2);
+      ctx.fill();
+
+      ctx.strokeStyle = '#ffffff';
+      ctx.lineWidth = 2 * scaleFactor;
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+      ctx.beginPath();
+      ctx.moveTo(badgeCx - badgeR * 0.42, badgeCy + badgeR * 0.02);
+      ctx.lineTo(badgeCx - badgeR * 0.1, badgeCy + badgeR * 0.35);
+      ctx.lineTo(badgeCx + badgeR * 0.45, badgeCy - badgeR * 0.32);
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    // 3. Draw active 100% solid green pill boxes directly in snapshot pixel space (0.00px drift!)
+    for (const word of frozenMatchedWords) {
+      if (word.matchedItemId && completedIdsRef.current.has(word.matchedItemId)) continue;
+
+      const rx = word.bbox.x0 - padX;
+      const ry = word.bbox.y0 - padY;
+      const rw = word.bbox.x1 - word.bbox.x0 + padX * 2;
+      const rh = word.bbox.y1 - word.bbox.y0 + padY * 2;
+      const pillRadius = Math.min(10 * scaleFactor, Math.max(4 * scaleFactor, rh * 0.32));
+
+      ctx.save();
+      ctx.globalAlpha = 1;
+      ctx.shadowColor = '#22c55e';
+      ctx.shadowBlur = 8 * scaleFactor;
+
+      ctx.fillStyle = 'rgba(34, 197, 94, 0.26)';
+      ctx.beginPath();
+      ctx.roundRect(rx, ry, rw, rh, pillRadius);
+      ctx.fill();
+
+      ctx.strokeStyle = '#22c55e';
+      ctx.lineWidth = 2.6 * scaleFactor;
+      ctx.stroke();
+      ctx.restore();
+    }
+  }, [frozenMatchedWords, completedOnFreezeBoxes]);
+
+  useEffect(() => {
+    if (viewState === 'FROZEN_LOCK') {
+      renderFrozenCanvas();
+    }
+  }, [viewState, renderFrozenCanvas]);
 
   // Clean up media tracks immediately to release camera indicator on iOS/Android
   const stopTracks = useCallback(() => {
@@ -297,6 +356,156 @@ export const CameraView: React.FC<Props> = ({
     };
   }, [initCamera, stopTracks]);
 
+  // Resume Live Camera Viewfinder ("Scan Next / بەردەوامبوون")
+  const handleResumeLiveCamera = useCallback(() => {
+    triggerHaptic(35);
+    setViewState('LIVE_VIEWFINDER');
+    setFrozenMatchedWords([]);
+    setFrozenDetectedGroups([]);
+    setCompletedOnFreezeBoxes([]);
+    setFrozenAnalyzing(false);
+    setFrozenPan({ x: 0, y: 0 });
+    prevThumbLumaRef.current = null;
+  }, []);
+
+  // Instant Manual Tap-to-Freeze & High-Res Scan
+  const triggerFreezeAndScan = useCallback(async () => {
+    const video = videoRef.current;
+    const currentItems = activeChecklistRef.current.filter(
+      (i) => !completedIdsRef.current.has(i.id)
+    );
+    if (!video || isInitializing || currentItems.length === 0) return;
+    if (video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA || video.videoWidth === 0) return;
+
+    // 1. Immediate shutter flash + haptic + freeze current frame onto frozenBitmapRef
+    triggerHaptic(50);
+    setShutterFlash(true);
+    setTimeout(() => setShutterFlash(false), 180);
+
+    if (!frozenBitmapRef.current) {
+      frozenBitmapRef.current = document.createElement('canvas');
+    }
+
+    setCompletedOnFreezeBoxes([]);
+    setFrozenMatchedWords([]);
+    setFrozenDetectedGroups([]);
+    setFrozenPan({ x: 0, y: 0 });
+    setFrozenAnalyzing(true);
+    setViewState('FROZEN_LOCK');
+
+    const output = await scanSnapshot(video, matchMode, {
+      forceCaptureCanvas: frozenBitmapRef.current,
+      enableHaptics: true,
+      enableSound: true,
+    });
+
+    setFrozenAnalyzing(false);
+
+    if (output) {
+      setFrozenMatchedWords(output.result.matchedWords);
+      setFrozenDetectedGroups(output.result.detectedGroups);
+      renderFrozenCanvas();
+    }
+  }, [isInitializing, matchMode, scanSnapshot, renderFrozenCanvas]);
+
+  // State A (LIVE_VIEWFINDER): 120ms Motion Stability Detector + Auto-Freeze Smart Lock
+  useEffect(() => {
+    if (viewState !== 'LIVE_VIEWFINDER' || isInitializing) return;
+
+    let isCancelled = false;
+    let isScanInFlight = false;
+
+    const intervalId = setInterval(async () => {
+      if (isCancelled || viewStateRef.current !== 'LIVE_VIEWFINDER') return;
+
+      const video = videoRef.current;
+      const currentItems = activeChecklistRef.current.filter(
+        (i) => !completedIdsRef.current.has(i.id)
+      );
+      if (
+        !video ||
+        currentItems.length === 0 ||
+        video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA ||
+        video.videoWidth === 0
+      ) {
+        return;
+      }
+
+      // 1. Measure motion stability via tiny 64x36 grayscale thumbnail comparison every 120ms
+      if (!motionThumbCanvasRef.current) {
+        motionThumbCanvasRef.current = document.createElement('canvas');
+        motionThumbCanvasRef.current.width = THUMB_W;
+        motionThumbCanvasRef.current.height = THUMB_H;
+      }
+      const thumbCtx = motionThumbCanvasRef.current.getContext('2d', {
+        alpha: false,
+        willReadFrequently: true,
+      });
+      if (!thumbCtx) return;
+
+      thumbCtx.drawImage(video, 0, 0, THUMB_W, THUMB_H);
+      const rgba = thumbCtx.getImageData(0, 0, THUMB_W, THUMB_H).data;
+      const pixelCount = THUMB_W * THUMB_H;
+      const currLuma = new Uint8Array(pixelCount);
+
+      let diffSum = 0;
+      const prevLuma = prevThumbLumaRef.current;
+
+      for (let i = 0, p = 0; i < pixelCount; i++, p += 4) {
+        const y = (rgba[p] * 77 + rgba[p + 1] * 150 + rgba[p + 2] * 29) >> 8;
+        currLuma[i] = y;
+        if (prevLuma) {
+          diffSum += Math.abs(y - prevLuma[i]);
+        }
+      }
+      prevThumbLumaRef.current = currLuma;
+
+      const meanDiff = prevLuma ? diffSum / pixelCount : 999;
+      const phoneIsSteady = meanDiff < STEADY_DIFF_THRESHOLD;
+      setIsSteady(phoneIsSteady);
+
+      // 2. In Auto-Freeze mode, when the phone is held steady, capture high-res snapshot & scan
+      if (scanMode === 'auto' && phoneIsSteady && !isScanInFlight) {
+        isScanInFlight = true;
+        try {
+          if (!frozenBitmapRef.current) {
+            frozenBitmapRef.current = document.createElement('canvas');
+          }
+
+          const output = await scanSnapshot(video, matchMode, {
+            forceCaptureCanvas: frozenBitmapRef.current,
+            enableHaptics: true,
+            enableSound: true,
+          });
+
+          // Auto-Freeze on Match: the instant >=1 target items are found, lock onto FROZEN_LOCK!
+          if (
+            !isCancelled &&
+            viewStateRef.current === 'LIVE_VIEWFINDER' &&
+            output &&
+            output.result.detectedGroups.length > 0
+          ) {
+            setShutterFlash(true);
+            setTimeout(() => setShutterFlash(false), 180);
+
+            setCompletedOnFreezeBoxes([]);
+            setFrozenMatchedWords(output.result.matchedWords);
+            setFrozenDetectedGroups(output.result.detectedGroups);
+            setFrozenPan({ x: 0, y: 0 });
+            setViewState('FROZEN_LOCK');
+          }
+        } finally {
+          isScanInFlight = false;
+        }
+      }
+    }, 120);
+
+    return () => {
+      isCancelled = true;
+      clearInterval(intervalId);
+    };
+  }, [viewState, isInitializing, scanMode, matchMode, scanSnapshot]);
+
   // Torch Toggle
   const toggleTorch = async () => {
     if (!streamRef.current || !torchAvailable) return;
@@ -318,17 +527,19 @@ export const CameraView: React.FC<Props> = ({
   const flipCamera = () => {
     setIsFrontCamera((prev) => !prev);
     setIsTorchOn(false);
-    trackedBoxesRef.current = [];
+    handleResumeLiveCamera();
   };
 
-  // Apply Hardware Optical Zoom (or synchronized CSS parent zoom fallback)
+  // Apply Zoom (1x, 2x, 3x) — works in both LIVE_VIEWFINDER and FROZEN_LOCK
   const applyZoom = async (level: number) => {
     setZoomLevel(level);
-    trackedBoxesRef.current = [];
+    if (level === 1) {
+      setFrozenPan({ x: 0, y: 0 });
+    }
     if (!streamRef.current) return;
     const videoTrack = streamRef.current.getVideoTracks()[0];
 
-    if (videoTrack && hardwareZoomAvailable) {
+    if (videoTrack && hardwareZoomAvailable && viewState === 'LIVE_VIEWFINDER') {
       try {
         const clampedZoom = Math.min(zoomMinMax.max, Math.max(zoomMinMax.min, level));
         await videoTrack.applyConstraints({
@@ -340,202 +551,57 @@ export const CameraView: React.FC<Props> = ({
     }
   };
 
-  // Manual scan trigger
-  const triggerManualScan = useCallback(async () => {
-    const video = videoRef.current;
-    const currentItems = activeChecklistRef.current.filter(
-      (i) => !completedIdsRef.current.has(i.id)
-    );
-    if (video && !isInitializing && currentItems.length > 0) {
-      if (video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA && video.videoWidth > 0) {
-        setManualScanPulse(true);
-        triggerHaptic(40);
-        await scanSource(video, currentItems, matchMode, true, true);
-        setTimeout(() => setManualScanPulse(false), 500);
-      }
-    }
-  }, [isInitializing, matchMode, scanSource]);
+  // Handle single item "✓ Done" completion (from bottom chip OR direct tap on a green box)
+  const handleMarkItemDone = useCallback(
+    (item: ChecklistItem) => {
+      triggerHaptic(60);
 
-  // Adaptive Zero-Delay Async OCR Loop
-  useEffect(() => {
-    if (scanMode !== 'auto' || isInitializing) return;
+      completedIdsRef.current.add(item.id);
+      purgeItem(item.id);
 
-    let isRunning = true;
-
-    const runAdaptiveLoop = async () => {
-      while (isRunning) {
-        const video = videoRef.current;
-        const currentItems = activeChecklistRef.current.filter(
-          (i) => !completedIdsRef.current.has(i.id)
-        );
-
-        if (
-          video &&
-          currentItems.length > 0 &&
-          video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA &&
-          video.videoWidth > 0
-        ) {
-          await scanSource(video, currentItems, matchMode, true, true);
-          await new Promise((r) => setTimeout(r, 12));
-        } else {
-          await new Promise((r) => setTimeout(r, 50));
+      // Convert active green boxes for this item into completed ✓ badges on the frozen image
+      setFrozenMatchedWords((prevWords) => {
+        const wordsForCompleted = prevWords.filter((w) => w.matchedItemId === item.id);
+        if (wordsForCompleted.length > 0) {
+          setCompletedOnFreezeBoxes((prevDone) => [
+            ...prevDone,
+            ...wordsForCompleted.map((w) => ({
+              id: w.id,
+              itemId: item.id,
+              text: item.text,
+              bbox: w.bbox,
+            })),
+          ]);
         }
-      }
-    };
+        return prevWords.filter((w) => w.matchedItemId !== item.id);
+      });
 
-    void runAdaptiveLoop();
-
-    return () => {
-      isRunning = false;
-    };
-  }, [isInitializing, scanSource, matchMode, scanMode]);
-
-  // Exact Intrinsic-Video-to-Screen Coordinate Mapper & Instant-Snap 60fps Renderer
-  useEffect(() => {
-    let animId: number;
-
-    const render = () => {
-      const canvas = canvasRef.current;
-      const container = containerRef.current;
-      const videoEl = videoRef.current;
-
-      if (canvas && container && videoEl) {
-        // Read untransformed viewport dimensions from container so CSS scale(zoomLevel) on shared wrapper never double-scales!
-        const viewW = container.clientWidth || window.innerWidth;
-        const viewH = container.clientHeight || window.innerHeight;
-        const dpr = window.devicePixelRatio || 1;
-
-        const targetW = Math.round(viewW * dpr);
-        const targetH = Math.round(viewH * dpr);
-
-        if (canvas.width !== targetW || canvas.height !== targetH) {
-          canvas.width = targetW;
-          canvas.height = targetH;
-        }
-
-        const ctx = canvas.getContext('2d');
-        if (ctx) {
-          ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-          ctx.clearRect(0, 0, viewW, viewH);
-
-          const videoW = videoEl.videoWidth || scanDimsRef.current.w;
-          const videoH = videoEl.videoHeight || scanDimsRef.current.h;
-
-          if (videoW > 0 && videoH > 0 && viewW > 0 && viewH > 0) {
-            // Map full intrinsic video coordinates (videoW, videoH) to object-fit: cover screen rect (viewW, viewH)
-            const scale = Math.max(viewW / videoW, viewH / videoH);
-            const offsetX = (viewW - videoW * scale) / 2;
-            const offsetY = (viewH - videoH * scale) / 2;
-
-            const now = performance.now();
-            const liveActiveIds = new Set(
-              activeChecklistRef.current
-                .filter((i) => !completedIdsRef.current.has(i.id))
-                .map((i) => i.id)
-            );
-
-            // Prune stale tracks (> 400ms) and completed items immediately
-            const activeTracks = trackedBoxesRef.current.filter(
-              (tr) =>
-                now - tr.lastSeenTimestamp < HOLD_TTL_MS &&
-                liveActiveIds.has(tr.targetId) &&
-                !completedIdsRef.current.has(tr.targetId)
-            );
-            trackedBoxesRef.current = activeTracks;
-
-            for (let i = 0; i < activeTracks.length; i++) {
-              const tr = activeTracks[i];
-              let screenX = tr.bbox.x0 * scale + offsetX;
-              const screenY = tr.bbox.y0 * scale + offsetY;
-              const screenW = (tr.bbox.x1 - tr.bbox.x0) * scale;
-              const screenH = (tr.bbox.y1 - tr.bbox.y0) * scale;
-
-              if (isFrontCamera) {
-                screenX = viewW - (screenX + screenW);
-              }
-
-              // Instant snap on first detection or >45px row jump; smooth lerp=0.65 for micro jitter
-              if (!tr.initialized) {
-                tr.renderX = screenX;
-                tr.renderY = screenY;
-                tr.renderW = screenW;
-                tr.renderH = screenH;
-                tr.initialized = true;
-              } else {
-                const moveDist = Math.hypot(screenX - tr.renderX, screenY - tr.renderY);
-                if (moveDist >= 45) {
-                  tr.renderX = screenX;
-                  tr.renderY = screenY;
-                  tr.renderW = screenW;
-                  tr.renderH = screenH;
-                } else {
-                  const lerp = 0.65;
-                  tr.renderX += (screenX - tr.renderX) * lerp;
-                  tr.renderY += (screenY - tr.renderY) * lerp;
-                  tr.renderW += (screenW - tr.renderW) * lerp;
-                  tr.renderH += (screenH - tr.renderH) * lerp;
-                }
-              }
-
-              // Clean green pill box geometry
-              const padX = 3;
-              const padY = 1.5;
-              const rx = tr.renderX - padX;
-              const ry = tr.renderY - padY;
-              const rw = tr.renderW + padX * 2;
-              const rh = tr.renderH + padY * 2;
-              const pillRadius = Math.min(6, Math.max(3, rh * 0.3));
-
-              ctx.save();
-              ctx.globalAlpha = 1;
-              ctx.shadowColor = '#22c55e';
-              ctx.shadowBlur = 6;
-
-              ctx.fillStyle = 'rgba(34, 197, 94, 0.25)';
-              ctx.beginPath();
-              ctx.roundRect(rx, ry, rw, rh, pillRadius);
-              ctx.fill();
-
-              ctx.strokeStyle = '#22c55e';
-              ctx.lineWidth = 2.2;
-              ctx.stroke();
-
-              ctx.restore();
+      setFrozenDetectedGroups((prevGroups) => {
+        const remaining = prevGroups.filter((g) => g.item.id !== item.id);
+        // If all found items on this frozen frame have now been checked off and more items remain in the checklist,
+        // automatically unfreeze back to LIVE_VIEWFINDER after a brief 420ms confirmation!
+        const totalRemainingInQueue = activeChecklistRef.current.filter(
+          (i) => i.id !== item.id && !completedIdsRef.current.has(i.id)
+        ).length;
+        if (remaining.length === 0 && totalRemainingInQueue > 0 && viewStateRef.current === 'FROZEN_LOCK') {
+          setTimeout(() => {
+            if (viewStateRef.current === 'FROZEN_LOCK') {
+              handleResumeLiveCamera();
             }
-          }
+          }, 420);
         }
-      }
+        return remaining;
+      });
 
-      animId = requestAnimationFrame(render);
-    };
+      setSuccessToast(t.completedToast(item.text));
+      setTimeout(() => {
+        setSuccessToast(null);
+      }, 1800);
 
-    animId = requestAnimationFrame(render);
-    return () => {
-      cancelAnimationFrame(animId);
-    };
-  }, [isFrontCamera]);
-
-  // Handle single item "✓" completion
-  const handleMarkItemDone = (item: ChecklistItem) => {
-    triggerHaptic(60);
-
-    completedIdsRef.current.add(item.id);
-    purgeItem(item.id);
-
-    trackedBoxesRef.current = trackedBoxesRef.current.filter(
-      (b) => b.targetId !== item.id
-    );
-    detectedGroupsRef.current = detectedGroupsRef.current.filter(
-      (g) => g.item.id !== item.id
-    );
-
-    setSuccessToast(t.completedToast(item.text));
-    setTimeout(() => {
-      setSuccessToast(null);
-    }, 1800);
-
-    onCompleteItem(item);
-  };
+      onCompleteItem(item);
+    },
+    [onCompleteItem, purgeItem, t, handleResumeLiveCamera]
+  );
 
   // Handle "Mark All Found (✓)" batch completion
   const handleMarkAllFound = (groups: DetectedMatchGroup[]) => {
@@ -544,17 +610,31 @@ export const CameraView: React.FC<Props> = ({
 
     const itemsToComplete = groups.map((g) => g.item);
     const idsToPurge = itemsToComplete.map((i) => i.id);
+    const purgeSet = new Set(idsToPurge);
 
     for (const id of idsToPurge) {
       completedIdsRef.current.add(id);
     }
     purgeMultipleItems(idsToPurge);
 
-    const purgeSet = new Set(idsToPurge);
-    trackedBoxesRef.current = trackedBoxesRef.current.filter(
-      (b) => !purgeSet.has(b.targetId)
-    );
-    detectedGroupsRef.current = [];
+    setFrozenMatchedWords((prevWords) => {
+      const wordsForCompleted = prevWords.filter(
+        (w) => w.matchedItemId && purgeSet.has(w.matchedItemId)
+      );
+      if (wordsForCompleted.length > 0) {
+        setCompletedOnFreezeBoxes((prevDone) => [
+          ...prevDone,
+          ...wordsForCompleted.map((w) => ({
+            id: w.id,
+            itemId: w.matchedItemId!,
+            text: w.matchedItemText || w.text,
+            bbox: w.bbox,
+          })),
+        ]);
+      }
+      return prevWords.filter((w) => !w.matchedItemId || !purgeSet.has(w.matchedItemId));
+    });
+    setFrozenDetectedGroups([]);
 
     const summaryText =
       itemsToComplete.length === 1
@@ -572,6 +652,119 @@ export const CameraView: React.FC<Props> = ({
         onCompleteItem(item);
       }
     }
+
+    const totalRemainingInQueue = activeChecklistRef.current.filter(
+      (i) => !purgeSet.has(i.id) && !completedIdsRef.current.has(i.id)
+    ).length;
+    if (totalRemainingInQueue > 0) {
+      setTimeout(() => {
+        if (viewStateRef.current === 'FROZEN_LOCK') {
+          handleResumeLiveCamera();
+        }
+      }, 450);
+    }
+  };
+
+  // Interactive Direct Tap-on-Box in FROZEN_LOCK Mode
+  const handleFrozenCanvasClick = (e: React.MouseEvent<HTMLCanvasElement>) => {
+    if (viewState !== 'FROZEN_LOCK' || touchGestureRef.current.hasMoved) return;
+
+    const canvas = frozenCanvasRef.current;
+    if (!canvas || canvas.width === 0 || canvas.height === 0) return;
+
+    const rect = canvas.getBoundingClientRect();
+    if (rect.width === 0 || rect.height === 0) return;
+
+    // Convert client tap coordinates into the displayed rect of the canvas (accounting for object-fit: cover)
+    const localX = e.clientX - rect.left;
+    const localY = e.clientY - rect.top;
+
+    const snapW = canvas.width;
+    const snapH = canvas.height;
+    const coverScale = Math.max(rect.width / snapW, rect.height / snapH);
+    const offsetX = (rect.width - snapW * coverScale) * 0.5;
+    const offsetY = (rect.height - snapH * coverScale) * 0.5;
+
+    const tapSnapX = (localX - offsetX) / coverScale;
+    const tapSnapY = (localY - offsetY) / coverScale;
+
+    // Generous touch hit-padding (18px in snapshot space) so small receipt rows are effortless to tap
+    const hitPad = Math.max(16, snapW * 0.018);
+
+    for (const word of frozenMatchedWords) {
+      if (!word.matchedItemId || completedIdsRef.current.has(word.matchedItemId)) continue;
+      if (
+        tapSnapX >= word.bbox.x0 - hitPad &&
+        tapSnapX <= word.bbox.x1 + hitPad &&
+        tapSnapY >= word.bbox.y0 - hitPad &&
+        tapSnapY <= word.bbox.y1 + hitPad
+      ) {
+        const matchedItem = activeChecklistRef.current.find((i) => i.id === word.matchedItemId);
+        if (matchedItem) {
+          e.stopPropagation();
+          handleMarkItemDone(matchedItem);
+          return;
+        }
+      }
+    }
+
+    // If no matches exist on this frozen snapshot and user taps background, resume live viewfinder
+    if (frozenDetectedGroups.length === 0 && !frozenAnalyzing) {
+      handleResumeLiveCamera();
+    }
+  };
+
+  // Touch Pinch-to-Zoom (1x..4x) & Pan on Frozen Snapshot
+  const handleTouchStart = (e: React.TouchEvent<HTMLDivElement>) => {
+    if (viewState !== 'FROZEN_LOCK') return;
+
+    if (e.touches.length === 2) {
+      const dx = e.touches[0].clientX - e.touches[1].clientX;
+      const dy = e.touches[0].clientY - e.touches[1].clientY;
+      touchGestureRef.current.initialPinchDist = Math.hypot(dx, dy);
+      touchGestureRef.current.initialZoom = zoomLevel;
+      touchGestureRef.current.hasMoved = true;
+    } else if (e.touches.length === 1) {
+      touchGestureRef.current.isDragging = true;
+      touchGestureRef.current.hasMoved = false;
+      touchGestureRef.current.startX = e.touches[0].clientX;
+      touchGestureRef.current.startY = e.touches[0].clientY;
+      touchGestureRef.current.startPanX = frozenPan.x;
+      touchGestureRef.current.startPanY = frozenPan.y;
+    }
+  };
+
+  const handleTouchMove = (e: React.TouchEvent<HTMLDivElement>) => {
+    if (viewState !== 'FROZEN_LOCK') return;
+
+    if (e.touches.length === 2 && touchGestureRef.current.initialPinchDist) {
+      const dx = e.touches[0].clientX - e.touches[1].clientX;
+      const dy = e.touches[0].clientY - e.touches[1].clientY;
+      const dist = Math.hypot(dx, dy);
+      const ratio = dist / touchGestureRef.current.initialPinchDist;
+      const nextZoom = Math.min(4, Math.max(1, Number((touchGestureRef.current.initialZoom * ratio).toFixed(2))));
+      setZoomLevel(nextZoom);
+      if (nextZoom <= 1.02) {
+        setFrozenPan({ x: 0, y: 0 });
+      }
+      touchGestureRef.current.hasMoved = true;
+    } else if (e.touches.length === 1 && touchGestureRef.current.isDragging && zoomLevel > 1) {
+      const dx = e.touches[0].clientX - touchGestureRef.current.startX;
+      const dy = e.touches[0].clientY - touchGestureRef.current.startY;
+      if (Math.hypot(dx, dy) > 8) {
+        touchGestureRef.current.hasMoved = true;
+        const maxPan = 220 * (zoomLevel - 1);
+        setFrozenPan({
+          x: Math.max(-maxPan, Math.min(maxPan, touchGestureRef.current.startPanX + dx)),
+          y: Math.max(-maxPan, Math.min(maxPan, touchGestureRef.current.startPanY + dy)),
+        });
+      }
+    }
+  };
+
+  const handleTouchEnd = () => {
+    touchGestureRef.current.isDragging = false;
+    touchGestureRef.current.initialPinchDist = null;
   };
 
   const handleExit = () => {
@@ -582,7 +775,7 @@ export const CameraView: React.FC<Props> = ({
   const totalCount = Math.max(initialTotalCount, checklist.length + completedItems.length);
   const remainingCount = checklist.length;
   const activeIdSet = new Set(checklist.map((i) => i.id));
-  const detectedGroups = (lastScanResult?.detectedGroups || []).filter(
+  const detectedGroups = frozenDetectedGroups.filter(
     (g) => activeIdSet.has(g.item.id) && !completedIdsRef.current.has(g.item.id)
   );
   const isAllCompleted = checklist.length === 0 && totalCount > 0;
@@ -593,44 +786,66 @@ export const CameraView: React.FC<Props> = ({
     }
   }, [isAllCompleted, stopTracks]);
 
-  // If hardware zoom is supported, zoom is applied optically via track.applyConstraints() (zero CSS scale).
-  // If CSS digital zoom fallback is used, apply transform to the shared parent wrapper so <video> and <canvas> scale 1:1 together!
-  const digitalZoomCss = !hardwareZoomAvailable && zoomLevel > 1 ? `scale(${zoomLevel})` : '';
+  const liveDigitalZoomCss =
+    viewState === 'LIVE_VIEWFINDER' && !hardwareZoomAvailable && zoomLevel > 1
+      ? `scale(${zoomLevel})`
+      : '';
+  const frozenZoomPanCss =
+    viewState === 'FROZEN_LOCK'
+      ? `translate3d(${frozenPan.x}px, ${frozenPan.y}px, 0) scale(${zoomLevel})`
+      : '';
 
   return (
     <div
       ref={containerRef}
-      onClick={scanMode === 'manual' ? triggerManualScan : undefined}
-      className={`fixed inset-0 w-screen h-[100dvh] overflow-hidden bg-black select-none touch-none transition-all duration-300 ${
-        manualScanPulse ? 'ring-4 ring-inset ring-[#22c55e]/70' : ''
-      }`}
+      onTouchStart={handleTouchStart}
+      onTouchMove={handleTouchMove}
+      onTouchEnd={handleTouchEnd}
+      className="fixed inset-0 w-screen h-[100dvh] overflow-hidden bg-black select-none touch-none"
       dir="ltr"
     >
-      {/* Shared Zoom Wrapper: guarantees <video> and <canvas> are 100% pixel-locked at 1x, 2x, and 3x */}
-      <div
+      {/* STATE A: LIVE_VIEWFINDER (Tap anywhere on live video to freeze & scan immediately) */}
+      <video
+        ref={videoRef}
+        autoPlay
+        playsInline
+        muted
+        onClick={viewState === 'LIVE_VIEWFINDER' ? triggerFreezeAndScan : undefined}
         style={{
-          transform: digitalZoomCss || undefined,
+          transform:
+            `${isFrontCamera ? 'scaleX(-1)' : ''} ${liveDigitalZoomCss}`.trim() || undefined,
           transformOrigin: 'center center',
         }}
-        className="absolute inset-0 w-full h-full transition-transform duration-200"
+        className={`absolute inset-0 w-full h-full object-cover transition-transform duration-150 ${
+          viewState === 'FROZEN_LOCK' ? 'opacity-0 pointer-events-none' : 'opacity-100 cursor-pointer'
+        }`}
+      />
+
+      {/* STATE B: FROZEN_LOCK (100% Pixel-Accurate Highlighted Inspection Bitmap + Pinch Zoom/Pan + Tap Box) */}
+      <div
+        style={{
+          transform: frozenZoomPanCss || undefined,
+          transformOrigin: 'center center',
+        }}
+        className={`absolute inset-0 w-full h-full z-10 transition-transform duration-75 ${
+          viewState === 'FROZEN_LOCK' ? 'opacity-100 pointer-events-auto' : 'opacity-0 pointer-events-none'
+        }`}
       >
-        <video
-          ref={videoRef}
-          autoPlay
-          playsInline
-          muted
+        <canvas
+          ref={frozenCanvasRef}
+          onClick={handleFrozenCanvasClick}
           style={{
             transform: isFrontCamera ? 'scaleX(-1)' : undefined,
             transformOrigin: 'center center',
           }}
-          className="absolute inset-0 w-full h-full object-cover"
-        />
-
-        <canvas
-          ref={canvasRef}
-          className="absolute inset-0 w-full h-full pointer-events-none z-10"
+          className="w-full h-full object-cover cursor-pointer"
         />
       </div>
+
+      {/* Crisp Camera Shutter Flash Effect on Freeze */}
+      {shutterFlash && (
+        <div className="fixed inset-0 bg-white/75 z-40 pointer-events-none transition-opacity duration-150" />
+      )}
 
       {/* 1. TOP MINIMALIST GEOMETRIC BAR */}
       <div className="absolute top-20 inset-x-0 z-30 px-4 flex flex-col items-center gap-2 pointer-events-auto max-w-md mx-auto">
@@ -650,7 +865,9 @@ export const CameraView: React.FC<Props> = ({
             className="flex items-center gap-1.5 px-2.5 py-1 bg-slate-100 dark:bg-[#1a1a1a] border border-[#cbd5e1] dark:border-white/30 text-[#0f172a] dark:text-white text-xs font-bold active:scale-95 transition tabular-nums"
             dir={isRtl ? 'rtl' : 'ltr'}
           >
-            <span>{t.remainingItems}: {remainingCount}</span>
+            <span>
+              {t.remainingItems}: {remainingCount}
+            </span>
             <ChevronDown
               className={`w-3.5 h-3.5 transition-transform ${
                 showQueueDropdown ? 'rotate-180' : ''
@@ -658,7 +875,7 @@ export const CameraView: React.FC<Props> = ({
             />
           </button>
 
-          {/* Scan Mode: Auto vs Tap */}
+          {/* Scan Mode: Auto-Freeze vs Tap-to-Freeze */}
           <div className="flex items-center bg-slate-100 dark:bg-[#0a0a0a] p-0.5 text-[11px] font-bold border border-[#cbd5e1] dark:border-white/50">
             <button
               onClick={() => setScanMode('auto')}
@@ -694,7 +911,11 @@ export const CameraView: React.FC<Props> = ({
                 }`}
                 aria-label="Torch"
               >
-                {isTorchOn ? <Zap className="w-4 h-4 fill-current" /> : <ZapOff className="w-4 h-4" />}
+                {isTorchOn ? (
+                  <Zap className="w-4 h-4 fill-current" />
+                ) : (
+                  <ZapOff className="w-4 h-4" />
+                )}
               </button>
             )}
 
@@ -724,7 +945,9 @@ export const CameraView: React.FC<Props> = ({
             dir={isRtl ? 'rtl' : 'ltr'}
           >
             <div className="flex items-center justify-between pb-2 border-b border-[#cbd5e1] dark:border-white/25 text-xs font-bold">
-              <span>{t.activeChecklist} ({checklist.length})</span>
+              <span>
+                {t.activeChecklist} ({checklist.length})
+              </span>
               <button
                 onClick={() => setShowQueueDropdown(false)}
                 className="p-1 text-slate-500 dark:text-neutral-400 hover:opacity-80"
@@ -756,60 +979,98 @@ export const CameraView: React.FC<Props> = ({
         )}
       </div>
 
-      {/* 2. BOTTOM AREA: Compact Horizontal Multi-Match Chips + "Mark All Found (✓)" + 1x/2x/3x Zoom Bar */}
+      {/* 2. BOTTOM AREA: Frozen Match Chips + "Scan Next / بەردەوامبوون" + 1x/2x/3x Zoom Bar */}
       <div className="absolute bottom-0 inset-x-0 z-30 pb-[max(env(safe-area-inset-bottom,16px),24px)] px-4 pt-4 flex flex-col items-center gap-2.5 pointer-events-auto max-w-md mx-auto">
-        {detectedGroups.length > 0 && !showQueueDropdown && (
+        {/* FROZEN_LOCK Inspection Panel */}
+        {viewState === 'FROZEN_LOCK' && !showQueueDropdown && (
           <div
             className="w-full bg-white/95 dark:bg-[#0f0f0f]/95 backdrop-blur-md border-2 border-[#22c55e] p-2.5 shadow-2xl flex flex-col gap-2"
             dir={isRtl ? 'rtl' : 'ltr'}
           >
-            {/* Compact Horizontal Chips for all simultaneously detected items */}
-            <div className="flex flex-wrap items-center gap-1.5">
-              {detectedGroups.map((group) => (
-                <div
-                  key={group.item.id}
-                  className="inline-flex items-center gap-2 pl-2.5 pr-1.5 py-1 bg-slate-100 dark:bg-[#161616] border border-[#cbd5e1] dark:border-white/40 text-xs font-extrabold text-[#0f172a] dark:text-white"
-                >
-                  <span className="truncate max-w-[140px]" dir="ltr">
-                    {group.item.text}
-                  </span>
-                  {group.words.length > 1 && (
-                    <span className="text-[10px] font-mono text-[#22c55e] tabular-nums">
-                      ×{group.words.length}
-                    </span>
-                  )}
-                  <button
-                    onClick={() => handleMarkItemDone(group.item)}
-                    className="px-2 py-1 bg-[#248a3d] hover:bg-[#2aa147] active:scale-95 text-white font-bold text-[11px] transition flex items-center gap-1 shrink-0"
-                    title={t.doneButton}
-                  >
-                    <Check className="w-3.5 h-3.5 stroke-[3]" />
-                    <span>{t.doneButton}</span>
-                  </button>
+            {frozenAnalyzing ? (
+              <div className="py-2 flex items-center justify-center gap-2 text-xs font-bold text-[#0f172a] dark:text-white">
+                <ScanLine className="w-4 h-4 text-[#22c55e] animate-pulse" />
+                <span>Scanning high-res frame...</span>
+              </div>
+            ) : detectedGroups.length > 0 ? (
+              <>
+                {/* Compact Horizontal Chips for all simultaneously detected items */}
+                <div className="flex flex-wrap items-center gap-1.5">
+                  {detectedGroups.map((group) => (
+                    <div
+                      key={group.item.id}
+                      className="inline-flex items-center gap-2 pl-2.5 pr-1.5 py-1 bg-slate-100 dark:bg-[#161616] border border-[#cbd5e1] dark:border-white/40 text-xs font-extrabold text-[#0f172a] dark:text-white"
+                    >
+                      <span className="truncate max-w-[140px]" dir="ltr">
+                        {group.item.text}
+                      </span>
+                      {group.words.length > 1 && (
+                        <span className="text-[10px] font-mono text-[#22c55e] tabular-nums">
+                          ×{group.words.length}
+                        </span>
+                      )}
+                      <button
+                        onClick={() => handleMarkItemDone(group.item)}
+                        className="px-2 py-1 bg-[#248a3d] hover:bg-[#2aa147] active:scale-95 text-white font-bold text-[11px] transition flex items-center gap-1 shrink-0"
+                        title={t.doneButton}
+                      >
+                        <Check className="w-3.5 h-3.5 stroke-[3]" />
+                        <span>{t.doneButton}</span>
+                      </button>
+                    </div>
+                  ))}
                 </div>
-              ))}
-            </div>
 
-            {/* "Mark All Found (✓)" Action Button when multiple items are detected simultaneously */}
-            {detectedGroups.length > 1 && (
-              <button
-                onClick={() => handleMarkAllFound(detectedGroups)}
-                className="w-full py-2 px-3 bg-[#248a3d] hover:bg-[#2aa147] active:scale-98 text-white font-extrabold text-xs border border-white/30 transition flex items-center justify-center gap-1.5"
-              >
-                <CheckCheck className="w-4 h-4 stroke-[2.75]" />
-                <span>Mark All Found ({detectedGroups.length}) ✓</span>
-              </button>
+                {/* "Mark All Found (✓)" Action Button when multiple items are detected */}
+                {detectedGroups.length > 1 && (
+                  <button
+                    onClick={() => handleMarkAllFound(detectedGroups)}
+                    className="w-full py-2 px-3 bg-[#248a3d] hover:bg-[#2aa147] active:scale-98 text-white font-extrabold text-xs border border-white/30 transition flex items-center justify-center gap-1.5"
+                  >
+                    <CheckCheck className="w-4 h-4 stroke-[2.75]" />
+                    <span>Mark All Found ({detectedGroups.length}) ✓</span>
+                  </button>
+                )}
+              </>
+            ) : (
+              <div className="py-1 text-center text-xs font-bold text-slate-600 dark:text-neutral-300">
+                No target match in this frame
+              </div>
             )}
+
+            {/* Prominent "Resume Live Camera / Scan Next" Action Button */}
+            <button
+              onClick={handleResumeLiveCamera}
+              className="w-full py-2 px-3 bg-slate-900 dark:bg-white text-white dark:text-[#0a0a0a] font-extrabold text-xs border border-[#cbd5e1] dark:border-white transition active:scale-98 flex items-center justify-center gap-1.5"
+            >
+              <Play className="w-3.5 h-3.5 fill-current" />
+              <span>{ isRtl ? 'بەردەوامبوون / سکانێکی نوێ' : 'Scan Next / Resume Camera' }</span>
+            </button>
           </div>
         )}
 
-        {/* Manual Tap-to-Scan Prompt when in manual mode */}
-        {scanMode === 'manual' && detectedGroups.length === 0 && (
+        {/* LIVE_VIEWFINDER Trigger Button (Hold steady in Auto mode or Tap anytime to freeze & scan) */}
+        {viewState === 'LIVE_VIEWFINDER' && (
           <button
-            onClick={triggerManualScan}
-            className="px-4 py-2 bg-white/95 dark:bg-[#0f0f0f]/95 border border-[#cbd5e1] dark:border-white/75 text-xs font-bold text-[#0f172a] dark:text-white shadow-lg active:scale-95 transition"
+            onClick={triggerFreezeAndScan}
+            className="px-4 py-2 bg-white/95 dark:bg-[#0f0f0f]/95 border border-[#cbd5e1] dark:border-white/75 text-xs font-bold text-[#0f172a] dark:text-white shadow-lg active:scale-95 transition flex items-center gap-2"
           >
-            {t.tapScreenToScan}
+            <span
+              className={`w-2 h-2 rounded-full ${
+                isScanningSnapshot
+                  ? 'bg-[#22c55e] animate-ping'
+                  : isSteady
+                  ? 'bg-[#22c55e]'
+                  : 'bg-amber-400'
+              }`}
+            />
+            <span>
+              {scanMode === 'manual'
+                ? t.tapScreenToScan
+                : isScanningSnapshot
+                ? 'Scanning steady frame...'
+                : 'Hold steady or Tap to Freeze & Scan'}
+            </span>
           </button>
         )}
 
@@ -823,7 +1084,7 @@ export const CameraView: React.FC<Props> = ({
               <button
                 onClick={() => applyZoom(lvl)}
                 className={`px-3.5 py-1 transition active:scale-95 ${
-                  zoomLevel === lvl
+                  Math.round(zoomLevel) === lvl
                     ? 'bg-[#248a3d] text-white font-extrabold'
                     : 'text-[#0f172a] dark:text-white hover:opacity-75'
                 }`}
@@ -840,7 +1101,9 @@ export const CameraView: React.FC<Props> = ({
         <div className="fixed inset-0 z-40 bg-[#f8fafc] dark:bg-[#0a0a0a] p-6 flex flex-col items-center justify-center text-center text-[#0f172a] dark:text-white space-y-4">
           <div className="w-full max-w-xs border border-[#cbd5e1] dark:border-white/75 bg-white dark:bg-[#0f0f0f] p-6 space-y-4">
             <h3 className="text-base font-extrabold">{t.cameraPermissionDenied}</h3>
-            <p className="text-xs text-slate-500 dark:text-neutral-400">{t.cameraErrorInstructions}</p>
+            <p className="text-xs text-slate-500 dark:text-neutral-400">
+              {t.cameraErrorInstructions}
+            </p>
             <div className="flex flex-col gap-2.5 pt-2">
               <button
                 onClick={initCamera}
